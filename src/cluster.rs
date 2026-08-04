@@ -1,20 +1,112 @@
+use crate::history::OperationHistory;
 use crate::node::Node;
 use crate::types::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 
 const CLIENT_WRITE_TIMEOUT_MS: u64 = 2_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleAction {
+    Stop,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledFault {
+    pub at_ms: u64,
+    pub node: NodeId,
+    pub action: LifecycleAction,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FaultPlan {
+    pub seed: u64,
+    pub max_delay_ms: u64,
+    pub drop_rate_per_mille: u16,
+    pub duplicate_rate_per_mille: u16,
+    pub reorder_window: usize,
+    pub lifecycle: Vec<ScheduledFault>,
+}
+
+impl FaultPlan {
+    pub fn seeded(seed: u64) -> Self {
+        Self {
+            seed,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_max_delay_ms(mut self, max_delay_ms: u64) -> Self {
+        self.max_delay_ms = max_delay_ms;
+        self
+    }
+
+    pub fn with_drop_rate_per_mille(mut self, rate: u16) -> Self {
+        self.drop_rate_per_mille = rate.min(1_000);
+        self
+    }
+
+    pub fn with_duplicate_rate_per_mille(mut self, rate: u16) -> Self {
+        self.duplicate_rate_per_mille = rate.min(1_000);
+        self
+    }
+
+    pub fn with_reorder_window(mut self, window: usize) -> Self {
+        self.reorder_window = window;
+        self
+    }
+
+    pub fn stop_at(mut self, at_ms: u64, node: NodeId) -> Self {
+        self.lifecycle.push(ScheduledFault {
+            at_ms,
+            node,
+            action: LifecycleAction::Stop,
+        });
+        self.lifecycle.sort_by_key(|fault| fault.at_ms);
+        self
+    }
+
+    pub fn restart_at(mut self, at_ms: u64, node: NodeId) -> Self {
+        self.lifecycle.push(ScheduledFault {
+            at_ms,
+            node,
+            action: LifecycleAction::Restart,
+        });
+        self.lifecycle.sort_by_key(|fault| fault.at_ms);
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedMessage {
+    deliver_at: u64,
+    sequence: u64,
+    message: Message,
+}
+
 #[derive(Debug)]
 pub struct Cluster {
-    nodes: HashMap<NodeId, Node>,
-    messages: VecDeque<Message>,
+    // Node iteration is part of the simulator's event order. Keep it sorted
+    // so the same fault-plan seed produces the same run across processes.
+    nodes: BTreeMap<NodeId, Node>,
+    messages: Vec<QueuedMessage>,
     now_ms: u64,
-    stopped: HashMap<NodeId, bool>,
+    stopped: BTreeMap<NodeId, bool>,
     blocked: HashSet<(NodeId, NodeId)>,
+    fault_plan: FaultPlan,
+    rng_state: u64,
+    next_fault: usize,
+    next_message_sequence: u64,
+    history: OperationHistory,
+    next_operation_id: u64,
 }
 
 impl Cluster {
     pub fn new(size: usize) -> Self {
+        Self::with_fault_plan(size, FaultPlan::default())
+    }
+
+    pub fn with_fault_plan(size: usize, fault_plan: FaultPlan) -> Self {
         let ids: Vec<_> = (0..size).collect();
         let nodes = ids
             .iter()
@@ -25,10 +117,16 @@ impl Cluster {
             .collect();
         Self {
             nodes,
-            messages: VecDeque::new(),
+            messages: Vec::new(),
             now_ms: 0,
-            stopped: HashMap::new(),
+            stopped: BTreeMap::new(),
             blocked: HashSet::new(),
+            rng_state: fault_plan.seed,
+            fault_plan,
+            next_fault: 0,
+            next_message_sequence: 0,
+            history: OperationHistory::new(),
+            next_operation_id: 0,
         }
     }
 
@@ -51,6 +149,43 @@ impl Cluster {
 
     pub fn stop(&mut self, id: NodeId) {
         self.stopped.insert(id, true);
+    }
+
+    pub fn restart(&mut self, id: NodeId) {
+        self.stopped.insert(id, false);
+    }
+
+    pub fn is_stopped(&self, id: NodeId) -> bool {
+        self.is_stopped_internal(id)
+    }
+
+    pub fn compact_node(&mut self, id: NodeId, index: LogIndex) -> std::io::Result<Snapshot> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "unknown cluster node")
+            })?
+            .compact_to(index)
+    }
+
+    pub fn fault_plan(&self) -> &FaultPlan {
+        &self.fault_plan
+    }
+
+    pub fn queued_message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn history(&self) -> &OperationHistory {
+        &self.history
+    }
+
+    pub fn take_history(&mut self) -> OperationHistory {
+        std::mem::take(&mut self.history)
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
     }
 
     pub fn partition(&mut self, groups: &[Vec<NodeId>]) {
@@ -79,7 +214,7 @@ impl Cluster {
         let leaders: Vec<_> = self
             .nodes
             .values()
-            .filter(|node| !self.is_stopped(node.id()) && node.role() == Role::Leader)
+            .filter(|node| !self.is_stopped_internal(node.id()) && node.role() == Role::Leader)
             .map(|node| node.id())
             .collect();
         if leaders.len() == 1 {
@@ -90,7 +225,39 @@ impl Cluster {
     }
 
     pub fn propose(&mut self, leader: NodeId, request: ClientRequest) -> ClientReply {
-        if self.is_stopped(leader) {
+        self.propose_as(0, leader, request)
+    }
+
+    pub fn propose_as(
+        &mut self,
+        client_id: u64,
+        leader: NodeId,
+        request: ClientRequest,
+    ) -> ClientReply {
+        let operation_id = self.next_operation_id;
+        self.next_operation_id += 1;
+        let invoked_at = self.now_ms;
+        let reply = self.propose_unrecorded(leader, request.clone());
+        self.history.record(
+            operation_id,
+            client_id,
+            invoked_at,
+            self.now_ms,
+            request,
+            reply.clone(),
+        );
+        reply
+    }
+
+    fn propose_unrecorded(&mut self, leader: NodeId, request: ClientRequest) -> ClientReply {
+        if !self.nodes.contains_key(&leader) {
+            return ClientReply {
+                success: false,
+                leader_id: None,
+                response: None,
+            };
+        }
+        if self.is_stopped_internal(leader) {
             return ClientReply {
                 success: false,
                 leader_id: None,
@@ -135,7 +302,7 @@ impl Cluster {
             }
             if node.role() != Role::Leader
                 || node.current_term() != write.term
-                || self.is_stopped(leader)
+                || self.is_stopped_internal(leader)
             {
                 return ClientReply {
                     success: false,
@@ -192,9 +359,11 @@ impl Cluster {
     }
 
     fn step(&mut self) {
-        if let Some(message) = self.messages.pop_front() {
-            if self.is_stopped(message.from)
-                || self.is_stopped(message.to)
+        self.apply_scheduled_faults();
+        if let Some(index) = self.next_ready_message_index() {
+            let message = self.messages.remove(index).message;
+            if self.is_stopped_internal(message.from)
+                || self.is_stopped_internal(message.to)
                 || self.is_blocked(message.from, message.to)
             {
                 return;
@@ -208,9 +377,10 @@ impl Cluster {
             return;
         }
         self.now_ms += 1;
+        self.apply_scheduled_faults();
         let ids: Vec<_> = self.nodes.keys().copied().collect();
         for id in ids {
-            if self.is_stopped(id) {
+            if self.is_stopped_internal(id) {
                 continue;
             }
             let messages = self.nodes.get_mut(&id).unwrap().tick(self.now_ms);
@@ -220,16 +390,90 @@ impl Cluster {
 
     fn enqueue(&mut self, messages: Vec<Message>) {
         for message in messages {
-            if !self.is_stopped(message.from)
-                && !self.is_stopped(message.to)
+            if !self.is_stopped_internal(message.from)
+                && !self.is_stopped_internal(message.to)
                 && !self.is_blocked(message.from, message.to)
             {
-                self.messages.push_back(message);
+                if self.chance(self.fault_plan.drop_rate_per_mille) {
+                    continue;
+                }
+                let delay = self.random_delay();
+                self.push_message(message.clone(), delay);
+                if self.chance(self.fault_plan.duplicate_rate_per_mille) {
+                    let duplicate_delay = delay.saturating_add(self.random_delay());
+                    self.push_message(message, duplicate_delay);
+                }
             }
         }
     }
 
-    fn is_stopped(&self, id: NodeId) -> bool {
+    fn push_message(&mut self, message: Message, delay: u64) {
+        let sequence = self.next_message_sequence;
+        self.next_message_sequence += 1;
+        self.messages.push(QueuedMessage {
+            deliver_at: self.now_ms.saturating_add(delay),
+            sequence,
+            message,
+        });
+    }
+
+    fn next_ready_message_index(&mut self) -> Option<usize> {
+        let mut ready: Vec<_> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, queued)| (queued.deliver_at <= self.now_ms).then_some(index))
+            .collect();
+        if ready.is_empty() {
+            return None;
+        }
+        ready.sort_by_key(|&index| {
+            let queued = &self.messages[index];
+            (queued.deliver_at, queued.sequence)
+        });
+        let window = self.fault_plan.reorder_window.max(1).min(ready.len());
+        let offset = if window == 1 {
+            0
+        } else {
+            (self.next_random() as usize) % window
+        };
+        Some(ready[offset])
+    }
+
+    fn apply_scheduled_faults(&mut self) {
+        while let Some(fault) = self.fault_plan.lifecycle.get(self.next_fault).copied() {
+            if fault.at_ms > self.now_ms {
+                break;
+            }
+            match fault.action {
+                LifecycleAction::Stop => self.stop(fault.node),
+                LifecycleAction::Restart => self.restart(fault.node),
+            }
+            self.next_fault += 1;
+        }
+    }
+
+    fn random_delay(&mut self) -> u64 {
+        if self.fault_plan.max_delay_ms == 0 {
+            0
+        } else {
+            self.next_random() % (self.fault_plan.max_delay_ms + 1)
+        }
+    }
+
+    fn chance(&mut self, rate_per_mille: u16) -> bool {
+        rate_per_mille != 0 && (self.next_random() % 1_000) < u64::from(rate_per_mille)
+    }
+
+    fn next_random(&mut self) -> u64 {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        self.rng_state
+    }
+
+    fn is_stopped_internal(&self, id: NodeId) -> bool {
         self.stopped.get(&id).copied().unwrap_or(false)
     }
 

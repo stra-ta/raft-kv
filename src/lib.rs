@@ -1,4 +1,5 @@
 pub mod cluster;
+pub mod history;
 pub mod lsm;
 pub mod net;
 pub mod node;
@@ -8,12 +9,16 @@ pub mod storage;
 pub mod types;
 
 // Re-export public API from sub-modules.
-pub use cluster::Cluster;
-pub use node::{Node, PendingWrite};
+pub use cluster::{Cluster, FaultPlan, LifecycleAction, ScheduledFault};
+pub use history::{
+    HistoryOperation, LinearizabilityViolation, OperationHistory, check_linearizable,
+};
+pub use node::{Node, PendingWrite, SnapshotInstallResult};
 pub use state_machine::{MemoryStateMachine, StateMachine};
 pub use types::{
-    AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, LogEntry, LogIndex,
-    Message, NodeId, RequestVote, RequestVoteReply, Role, Rpc, Term,
+    AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, InstallSnapshotReply,
+    LogEntry, LogIndex, Message, NodeId, RequestVote, RequestVoteReply, Role, Rpc,
+    SNAPSHOT_FORMAT_VERSION, Snapshot, StateSnapshot, Term,
 };
 
 #[cfg(test)]

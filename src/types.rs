@@ -4,6 +4,8 @@ pub type NodeId = usize;
 pub type Term = u64;
 pub type LogIndex = usize;
 
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Role {
     Follower,
@@ -56,6 +58,57 @@ pub struct AppendEntriesReply {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateSnapshot {
+    pub version: u32,
+    pub last_applied: LogIndex,
+    pub data: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Snapshot {
+    pub version: u32,
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    pub state: StateSnapshot,
+}
+
+impl Snapshot {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.version != SNAPSHOT_FORMAT_VERSION || self.state.version != SNAPSHOT_FORMAT_VERSION
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported snapshot format version",
+            ));
+        }
+        if self.last_included_index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot boundary must be greater than zero",
+            ));
+        }
+        if self.state.last_applied != self.last_included_index {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot state index does not match snapshot boundary",
+            ));
+        }
+        if self
+            .state
+            .data
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot keys must be unique and sorted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ClientRequest {
     Get { key: String },
     LocalGet { key: String },
@@ -76,6 +129,15 @@ pub enum Rpc {
     RequestVoteReply(RequestVoteReply),
     AppendEntries(AppendEntries),
     AppendEntriesReply(AppendEntriesReply),
+    InstallSnapshot(Snapshot),
+    InstallSnapshotReply(InstallSnapshotReply),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstallSnapshotReply {
+    pub term: Term,
+    pub accepted: bool,
+    pub last_included_index: LogIndex,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

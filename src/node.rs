@@ -14,6 +14,11 @@ pub struct Node<S: StateMachine = MemoryStateMachine> {
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    /// When non-zero, `log[0]` is the snapshot boundary and subsequent
+    /// entries start at `log_base_index + 1`. Before compaction the base is
+    /// zero and the vector keeps the original 1-based log representation.
+    log_base_index: LogIndex,
+    snapshot: Option<Snapshot>,
     commit_index: LogIndex,
     last_applied: LogIndex,
     state_machine: S,
@@ -33,6 +38,12 @@ pub struct Node<S: StateMachine = MemoryStateMachine> {
 pub struct PendingWrite {
     pub index: LogIndex,
     pub term: Term,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotInstallResult {
+    Installed,
+    Stale,
 }
 
 impl Node<MemoryStateMachine> {
@@ -69,6 +80,8 @@ impl<S: StateMachine> Node<S> {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            log_base_index: 0,
+            snapshot: None,
             commit_index: 0,
             last_applied: state_machine.last_applied(),
             state_machine,
@@ -103,6 +116,59 @@ impl<S: StateMachine> Node<S> {
         node
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the persisted node fields are kept explicit for the versioned storage boundary"
+    )]
+    pub fn from_persisted_parts(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        current_term: Term,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+        commit_index: LogIndex,
+        snapshot: Option<Snapshot>,
+        state_machine: S,
+    ) -> std::io::Result<Self> {
+        let mut node = Self::new_with_state_machine(id, peers, state_machine);
+        node.current_term = current_term;
+        node.voted_for = voted_for;
+        node.log = log;
+        node.snapshot = snapshot;
+        if let Some(snapshot) = &node.snapshot {
+            snapshot.validate()?;
+            node.log_base_index = snapshot.last_included_index;
+            if node.log_base_index == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "zero-index snapshot is not a valid log boundary",
+                ));
+            }
+            if node
+                .log
+                .first()
+                .is_none_or(|entry| entry.term != snapshot.last_included_term)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persisted log does not match snapshot boundary",
+                ));
+            }
+            node.state_machine.restore_snapshot(&snapshot.state)?;
+            if node.state_machine.last_applied() != snapshot.last_included_index {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "restored state machine index does not match snapshot",
+                ));
+            }
+        }
+        node.commit_index = commit_index.min(node.last_log_index());
+        node.commit_index = node.commit_index.max(node.log_base_index);
+        node.last_applied = node.state_machine.last_applied();
+        node.apply_committed()?;
+        Ok(node)
+    }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -127,6 +193,12 @@ impl<S: StateMachine> Node<S> {
     }
     pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.log_base_index
     }
     pub fn commit_index(&self) -> LogIndex {
         self.commit_index
@@ -192,6 +264,12 @@ impl<S: StateMachine> Node<S> {
                 rpc: Rpc::AppendEntriesReply(self.handle_append_entries(a, now_ms)),
             }],
             Rpc::AppendEntriesReply(r) => self.handle_append_entries_reply(from, r),
+            Rpc::InstallSnapshot(snapshot) => vec![Message {
+                from: self.id,
+                to: from,
+                rpc: Rpc::InstallSnapshotReply(self.handle_install_snapshot(snapshot, now_ms)),
+            }],
+            Rpc::InstallSnapshotReply(reply) => self.handle_install_snapshot_reply(from, reply),
         }
     }
 
@@ -314,6 +392,91 @@ impl<S: StateMachine> Node<S> {
         self.term_at(write.index) == Some(write.term)
             && self.commit_index >= write.index
             && self.last_applied >= write.index
+    }
+
+    /// Builds a snapshot at the last applied index. Snapshot creation never
+    /// includes uncommitted log entries.
+    pub fn create_snapshot(&self) -> std::io::Result<Snapshot> {
+        let state = self.state_machine.snapshot()?;
+        let index = self.last_applied;
+        if state.last_applied != index {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state machine snapshot index is stale",
+            ));
+        }
+        let snapshot = Snapshot {
+            version: SNAPSHOT_FORMAT_VERSION,
+            last_included_index: index,
+            last_included_term: self.term_at(index).unwrap_or(0),
+            state,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Replaces the log prefix with a durable snapshot boundary. Compaction
+    /// is intentionally limited to the applied point so the state machine and
+    /// remaining log cannot describe different histories.
+    pub fn compact_to(&mut self, index: LogIndex) -> std::io::Result<Snapshot> {
+        if index <= self.log_base_index || index != self.last_applied || index > self.commit_index {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "log compaction requires a newer committed applied index",
+            ));
+        }
+        let snapshot = self.create_snapshot()?;
+        let suffix = self.entries_after(index).to_vec();
+        self.log = std::iter::once(LogEntry {
+            term: snapshot.last_included_term,
+            command: Command::Noop,
+        })
+        .chain(suffix)
+        .collect();
+        self.log_base_index = index;
+        self.snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn install_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+    ) -> std::io::Result<SnapshotInstallResult> {
+        snapshot.validate()?;
+        if snapshot.last_included_index < self.log_base_index
+            || (snapshot.last_included_index == self.log_base_index
+                && self.snapshot.as_ref().is_some_and(|current| {
+                    current.last_included_term == snapshot.last_included_term
+                }))
+        {
+            return Ok(SnapshotInstallResult::Stale);
+        }
+        if snapshot.last_included_index < self.commit_index {
+            return Ok(SnapshotInstallResult::Stale);
+        }
+
+        // Validate and restore the state machine before changing the log
+        // boundary. A malformed or stale snapshot therefore leaves the node
+        // untouched.
+        self.state_machine.restore_snapshot(&snapshot.state)?;
+        let suffix =
+            if self.term_at(snapshot.last_included_index) == Some(snapshot.last_included_term) {
+                self.entries_after(snapshot.last_included_index).to_vec()
+            } else {
+                Vec::new()
+            };
+        self.log = std::iter::once(LogEntry {
+            term: snapshot.last_included_term,
+            command: Command::Noop,
+        })
+        .chain(suffix)
+        .collect();
+        self.log_base_index = snapshot.last_included_index;
+        self.snapshot = Some(snapshot.clone());
+        self.commit_index = self.commit_index.max(snapshot.last_included_index);
+        self.last_applied = snapshot.last_included_index;
+        self.leader_id = None;
+        Ok(SnapshotInstallResult::Installed)
     }
 
     fn start_election(&mut self, now_ms: u64) -> Vec<Message> {
@@ -456,6 +619,13 @@ impl<S: StateMachine> Node<S> {
         }
         self.leader_id = Some(request.leader_id);
         self.reset_election_timer(now_ms);
+        if request.prev_log_index < self.log_base_index {
+            return AppendEntriesReply {
+                term: self.current_term,
+                success: false,
+                match_index: 0,
+            };
+        }
         if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
             tracing::info!(
                 node = self.id,
@@ -472,7 +642,7 @@ impl<S: StateMachine> Node<S> {
         let mut index = request.prev_log_index + 1;
         for entry in request.entries {
             if self.term_at(index).is_some_and(|term| term != entry.term) {
-                self.log.truncate(index - 1);
+                self.truncate_from(index);
             }
             if self.term_at(index).is_none() {
                 self.log.push(entry);
@@ -544,8 +714,17 @@ impl<S: StateMachine> Node<S> {
             .get(&peer)
             .copied()
             .unwrap_or(self.last_log_index() + 1);
+        if next <= self.log_base_index
+            && let Some(snapshot) = self.snapshot.clone()
+        {
+            return Message {
+                from: self.id,
+                to: peer,
+                rpc: Rpc::InstallSnapshot(snapshot),
+            };
+        }
         let prev_log_index = next.saturating_sub(1);
-        let entries = self.log.iter().skip(next - 1).cloned().collect();
+        let entries = self.entries_from(next).to_vec();
         Message {
             from: self.id,
             to: peer,
@@ -558,6 +737,39 @@ impl<S: StateMachine> Node<S> {
                 leader_commit: self.commit_index,
             }),
         }
+    }
+
+    fn handle_install_snapshot(&mut self, snapshot: Snapshot, now_ms: u64) -> InstallSnapshotReply {
+        let index = snapshot.last_included_index;
+        let already_have_boundary = self.log_base_index == index
+            && self.term_at(index) == Some(snapshot.last_included_term);
+        let result = self.install_snapshot(snapshot);
+        if result.is_ok() {
+            self.reset_election_timer(now_ms);
+        }
+        InstallSnapshotReply {
+            term: self.current_term,
+            accepted: matches!(result, Ok(SnapshotInstallResult::Installed))
+                || (already_have_boundary && matches!(result, Ok(SnapshotInstallResult::Stale))),
+            last_included_index: index,
+        }
+    }
+
+    fn handle_install_snapshot_reply(
+        &mut self,
+        from: NodeId,
+        reply: InstallSnapshotReply,
+    ) -> Vec<Message> {
+        if reply.term > self.current_term {
+            self.step_down(reply.term, 0);
+            return Vec::new();
+        }
+        if self.role != Role::Leader || reply.term != self.current_term || !reply.accepted {
+            return Vec::new();
+        }
+        self.match_index.insert(from, reply.last_included_index);
+        self.next_index.insert(from, reply.last_included_index + 1);
+        vec![self.append_entries_for(from)]
     }
 
     fn advance_commit_index(&mut self) {
@@ -588,8 +800,17 @@ impl<S: StateMachine> Node<S> {
     fn apply_committed(&mut self) -> std::io::Result<()> {
         while self.last_applied < self.commit_index {
             let next = self.last_applied + 1;
-            self.state_machine
-                .apply(next, &self.log[next - 1].command)?;
+            let command = self
+                .entry_at(next)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "commit index is outside the retained log",
+                    )
+                })?
+                .command
+                .clone();
+            self.state_machine.apply(next, &command)?;
             self.last_applied = next;
         }
         Ok(())
@@ -626,16 +847,64 @@ impl<S: StateMachine> Node<S> {
         cluster_size / 2 + 1
     }
     pub fn last_log_index(&self) -> LogIndex {
-        self.log.len()
+        if self.log_base_index == 0 {
+            self.log.len()
+        } else {
+            self.log_base_index + self.log.len().saturating_sub(1)
+        }
     }
     fn last_log_term(&self) -> Term {
-        self.log.last().map_or(0, |entry| entry.term)
+        self.term_at(self.last_log_index()).unwrap_or(0)
     }
     pub fn term_at(&self, index: LogIndex) -> Option<Term> {
         if index == 0 {
             Some(0)
-        } else {
+        } else if self.log_base_index == 0 {
             self.log.get(index - 1).map(|entry| entry.term)
+        } else if index == self.log_base_index {
+            self.log.first().map(|entry| entry.term)
+        } else if index > self.log_base_index {
+            self.log
+                .get(index - self.log_base_index)
+                .map(|entry| entry.term)
+        } else {
+            None
+        }
+    }
+
+    fn entry_at(&self, index: LogIndex) -> Option<&LogEntry> {
+        if index == 0 {
+            None
+        } else if self.log_base_index == 0 {
+            self.log.get(index - 1)
+        } else if index > self.log_base_index {
+            self.log.get(index - self.log_base_index)
+        } else {
+            None
+        }
+    }
+
+    fn entries_from(&self, index: LogIndex) -> &[LogEntry] {
+        if self.log_base_index == 0 {
+            self.log.get(index.saturating_sub(1)..).unwrap_or(&[])
+        } else if index <= self.log_base_index {
+            &[]
+        } else {
+            self.log.get(index - self.log_base_index..).unwrap_or(&[])
+        }
+    }
+
+    fn entries_after(&self, index: LogIndex) -> &[LogEntry] {
+        self.entries_from(index.saturating_add(1))
+    }
+
+    fn truncate_from(&mut self, index: LogIndex) {
+        if self.log_base_index == 0 {
+            self.log.truncate(index.saturating_sub(1));
+        } else if index <= self.log_base_index {
+            self.log.truncate(1);
+        } else {
+            self.log.truncate(index - self.log_base_index);
         }
     }
 }
