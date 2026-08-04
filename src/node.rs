@@ -1,6 +1,6 @@
 use crate::state_machine::{MemoryStateMachine, StateMachine};
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const HEARTBEAT_MS: u64 = 50;
 const ELECTION_MIN_MS: u64 = 150;
@@ -27,6 +27,10 @@ pub struct Node<S: StateMachine = MemoryStateMachine> {
     last_heartbeat_at: u64,
     rng_state: u64,
     votes_granted: usize,
+    /// Voters that granted the current election term, including self. Guards
+    /// against counting a duplicated vote reply from the same peer twice,
+    /// which could otherwise win an election without a real majority.
+    granted_voters: HashSet<NodeId>,
     next_index: HashMap<NodeId, LogIndex>,
     match_index: HashMap<NodeId, LogIndex>,
     /// Index of the first log entry in the current term (noop). When commit_index
@@ -90,6 +94,7 @@ impl<S: StateMachine> Node<S> {
             last_heartbeat_at: 0,
             rng_state: (id as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
             votes_granted: 0,
+            granted_voters: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             term_start_index: 0,
@@ -263,13 +268,15 @@ impl<S: StateMachine> Node<S> {
                 to: from,
                 rpc: Rpc::AppendEntriesReply(self.handle_append_entries(a, now_ms)),
             }],
-            Rpc::AppendEntriesReply(r) => self.handle_append_entries_reply(from, r),
+            Rpc::AppendEntriesReply(r) => self.handle_append_entries_reply(from, r, now_ms),
             Rpc::InstallSnapshot(snapshot) => vec![Message {
                 from: self.id,
                 to: from,
-                rpc: Rpc::InstallSnapshotReply(self.handle_install_snapshot(snapshot, now_ms)),
+                rpc: Rpc::InstallSnapshotReply(self.handle_install_snapshot(
+                    from, snapshot, now_ms,
+                )),
             }],
-            Rpc::InstallSnapshotReply(reply) => self.handle_install_snapshot_reply(from, reply),
+            Rpc::InstallSnapshotReply(reply) => self.handle_install_snapshot_reply(from, reply, now_ms),
         }
     }
 
@@ -486,6 +493,8 @@ impl<S: StateMachine> Node<S> {
         self.voted_for = Some(self.id);
         self.leader_id = None;
         self.votes_granted = 1;
+        self.granted_voters.clear();
+        self.granted_voters.insert(self.id);
         self.reset_election_timer(now_ms);
         let request = RequestVote {
             term: self.current_term,
@@ -543,7 +552,7 @@ impl<S: StateMachine> Node<S> {
 
     fn handle_request_vote_reply(
         &mut self,
-        _from: NodeId,
+        from: NodeId,
         reply: RequestVoteReply,
         now_ms: u64,
     ) -> Vec<Message> {
@@ -560,7 +569,10 @@ impl<S: StateMachine> Node<S> {
         if self.role != Role::Candidate || reply.term != self.current_term || !reply.vote_granted {
             return Vec::new();
         }
-        self.votes_granted += 1;
+        if !self.granted_voters.insert(from) {
+            return Vec::new();
+        }
+        self.votes_granted = self.granted_voters.len();
         if self.votes_granted >= self.majority() {
             tracing::info!(
                 node = self.id,
@@ -670,6 +682,7 @@ impl<S: StateMachine> Node<S> {
         &mut self,
         from: NodeId,
         reply: AppendEntriesReply,
+        now_ms: u64,
     ) -> Vec<Message> {
         if reply.term > self.current_term {
             tracing::info!(
@@ -678,15 +691,23 @@ impl<S: StateMachine> Node<S> {
                 to_term = reply.term,
                 "leader step down for append reply"
             );
-            self.step_down(reply.term, 0);
+            self.step_down(reply.term, now_ms);
             return Vec::new();
         }
         if self.role != Role::Leader || reply.term != self.current_term {
             return Vec::new();
         }
         if reply.success {
-            self.match_index.insert(from, reply.match_index);
-            self.next_index.insert(from, reply.match_index + 1);
+            // Replies may be duplicated or reordered by the transport; never
+            // let a stale ack regress a peer's match point.
+            let matched = self
+                .match_index
+                .get(&from)
+                .copied()
+                .unwrap_or(0)
+                .max(reply.match_index);
+            self.match_index.insert(from, matched);
+            self.next_index.insert(from, matched + 1);
             self.advance_commit_index();
             Vec::new()
         } else {
@@ -739,12 +760,18 @@ impl<S: StateMachine> Node<S> {
         }
     }
 
-    fn handle_install_snapshot(&mut self, snapshot: Snapshot, now_ms: u64) -> InstallSnapshotReply {
+    fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        snapshot: Snapshot,
+        now_ms: u64,
+    ) -> InstallSnapshotReply {
         let index = snapshot.last_included_index;
         let already_have_boundary = self.log_base_index == index
             && self.term_at(index) == Some(snapshot.last_included_term);
         let result = self.install_snapshot(snapshot);
-        if result.is_ok() {
+        if matches!(result, Ok(SnapshotInstallResult::Installed)) {
+            self.leader_id = Some(from);
             self.reset_election_timer(now_ms);
         }
         InstallSnapshotReply {
@@ -759,16 +786,23 @@ impl<S: StateMachine> Node<S> {
         &mut self,
         from: NodeId,
         reply: InstallSnapshotReply,
+        now_ms: u64,
     ) -> Vec<Message> {
         if reply.term > self.current_term {
-            self.step_down(reply.term, 0);
+            self.step_down(reply.term, now_ms);
             return Vec::new();
         }
         if self.role != Role::Leader || reply.term != self.current_term || !reply.accepted {
             return Vec::new();
         }
-        self.match_index.insert(from, reply.last_included_index);
-        self.next_index.insert(from, reply.last_included_index + 1);
+        let matched = self
+            .match_index
+            .get(&from)
+            .copied()
+            .unwrap_or(0)
+            .max(reply.last_included_index);
+        self.match_index.insert(from, matched);
+        self.next_index.insert(from, matched + 1);
         vec![self.append_entries_for(from)]
     }
 
@@ -829,6 +863,10 @@ impl<S: StateMachine> Node<S> {
         self.current_term = term;
         self.voted_for = None;
         self.votes_granted = 0;
+        self.granted_voters.clear();
+        // A stepped-down leader no longer knows the current leader and must
+        // not redirect clients to itself.
+        self.leader_id = None;
         self.reset_election_timer(now_ms);
     }
 
@@ -906,5 +944,188 @@ impl<S: StateMachine> Node<S> {
         } else {
             self.log.truncate(index - self.log_base_index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elect(node: &mut Node, now_ms: u64) {
+        let _ = node.tick(now_ms);
+        assert_eq!(node.role(), Role::Candidate);
+        for peer in node.peers.clone() {
+            let _ = node.handle_message(
+                peer,
+                Rpc::RequestVoteReply(RequestVoteReply {
+                    term: node.current_term,
+                    vote_granted: true,
+                }),
+                now_ms,
+            );
+        }
+        assert_eq!(node.role(), Role::Leader);
+    }
+
+    #[test]
+    fn duplicate_vote_reply_is_counted_once() {
+        let mut node = Node::new(0, vec![1, 2, 3, 4]);
+        let _ = node.tick(300);
+        assert_eq!(node.role(), Role::Candidate);
+
+        let _ = node.handle_message(
+            1,
+            Rpc::RequestVoteReply(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+            300,
+        );
+        let _ = node.handle_message(
+            1,
+            Rpc::RequestVoteReply(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+            300,
+        );
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "a duplicated grant from one peer must not win the election"
+        );
+
+        let _ = node.handle_message(
+            2,
+            Rpc::RequestVoteReply(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+            300,
+        );
+        assert_eq!(node.role(), Role::Leader);
+    }
+
+    #[test]
+    fn step_down_resets_election_timer_from_now() {
+        let mut node = Node::new(0, vec![1, 2, 3, 4]);
+        elect(&mut node, 300);
+
+        let _ = node.handle_message(
+            1,
+            Rpc::AppendEntriesReply(AppendEntriesReply {
+                term: 5,
+                success: false,
+                match_index: 0,
+            }),
+            1000,
+        );
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 5);
+
+        let messages = node.tick(1001);
+        assert!(
+            messages.is_empty(),
+            "a node that just stepped down must wait out the election timeout, not campaign immediately"
+        );
+    }
+
+    #[test]
+    fn step_down_clears_stale_self_leader_hint() {
+        let mut node = Node::new(0, vec![1, 2, 3, 4]);
+        elect(&mut node, 300);
+        assert_eq!(node.leader_id(), Some(0));
+
+        let _ = node.handle_message(
+            1,
+            Rpc::AppendEntriesReply(AppendEntriesReply {
+                term: 9,
+                success: false,
+                match_index: 0,
+            }),
+            1000,
+        );
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(
+            node.leader_id(),
+            None,
+            "a stepped-down leader must not redirect clients to itself"
+        );
+    }
+
+    #[test]
+    fn stale_success_reply_does_not_regress_next_index() {
+        let mut node = Node::new(0, vec![1]);
+        elect(&mut node, 300);
+        let _ = node.start_client_write(ClientRequest::Set {
+            key: "k1".to_string(),
+            value: "v1".to_string(),
+        });
+        let _ = node.start_client_write(ClientRequest::Set {
+            key: "k2".to_string(),
+            value: "v2".to_string(),
+        });
+        assert_eq!(node.last_log_index(), 3);
+
+        let _ = node.handle_message(
+            1,
+            Rpc::AppendEntriesReply(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 3,
+            }),
+            300,
+        );
+        let _ = node.handle_message(
+            1,
+            Rpc::AppendEntriesReply(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+            300,
+        );
+        let messages = node.tick(360);
+        let heartbeat = messages
+            .iter()
+            .find_map(|message| match &message.rpc {
+                Rpc::AppendEntries(entries) if message.to == 1 => Some(entries),
+                _ => None,
+            })
+            .expect("leader sends a heartbeat to the peer");
+        assert_eq!(
+            heartbeat.prev_log_index, 3,
+            "a delayed duplicate success reply must not regress next_index and re-replicate"
+        );
+    }
+
+    #[test]
+    fn snapshot_install_records_the_sender_as_leader() {
+        let mut source = Node::from_parts(
+            0,
+            vec![1],
+            1,
+            None,
+            vec![LogEntry {
+                term: 1,
+                command: Command::Set {
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                },
+            }],
+            1,
+        );
+        let snapshot = source.compact_to(1).unwrap();
+        let mut node = Node::new(1, vec![0]);
+        assert_eq!(node.leader_id(), None);
+
+        let messages = node.handle_message(0, Rpc::InstallSnapshot(snapshot), 500);
+        assert_eq!(node.get("k"), Some("v".to_string()));
+        assert_eq!(
+            node.leader_id(),
+            Some(0),
+            "a follower that accepted a snapshot from its leader must remember the leader"
+        );
+        assert!(matches!(messages[0].rpc, Rpc::InstallSnapshotReply(_)));
     }
 }
