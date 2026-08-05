@@ -4,6 +4,11 @@
 
 A learning implementation of the Raft consensus algorithm in Rust, with a deterministic simulator and a real process runner over raw TCP. Not a production database.
 
+## Requirements
+
+- Stable Rust with Rust 2024 edition support
+- Docker Compose v2, only for the Prometheus and Grafana observability stack
+
 ![Cluster dashboard](docs/cluster-dashboard.svg)
 
 ## What this is
@@ -15,7 +20,7 @@ A from-scratch Raft core that understands leader election, log replication, majo
 - 3–5 node clusters
 - leader election with randomized 150–300 ms election timeouts
 - 50 ms heartbeats
-- client redirects from followers to the current leader
+- client retries supplied peer addresses until one accepts the request
 - replicated, committed writes through the leader
 - committed-state reads through the leader (reads blocked until leader proves current term)
 - log replication with majority commit
@@ -47,8 +52,9 @@ A from-scratch Raft core that understands leader election, log replication, majo
 ```mermaid
 flowchart LR
     C[client] --> A[any node]
-    A -- redirect if follower --> L[leader]
-    A -- accept if leader --> L
+    A -- reject + leader hint --> C
+    A -- accept if leader --> L[leader]
+    C --> L
     L --> F1[follower]
     L --> F2[follower]
     L --> F3[follower]
@@ -59,6 +65,8 @@ flowchart LR
 ## Failover story
 
 The simulator records the path from a steady leader to crash, election, and recovery.
+
+The generated timeline ([`docs/failover.svg`](docs/failover.svg)) and the explanatory story show different simulator traces, not one canonical node-by-node sequence.
 
 ![Failover story](docs/failover-story.svg)
 
@@ -112,7 +120,7 @@ cargo run --bin raft-node -- 2 ./data/node2.bin \
   0=127.0.0.1:5000 1=127.0.0.1:5001 2=127.0.0.1:5002
 ```
 
-Write and read (the client accepts multiple peer addresses and follows redirects):
+Write and read (the client retries the supplied peer addresses until one accepts the request):
 
 ```bash
 cargo run --bin raft-client -- 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002 set foo bar
@@ -128,9 +136,9 @@ The replicated state machine now sits behind a `StateMachine` trait. The simulat
 
 The LSM writes each committed command to a fsynced WAL before updating a `BTreeMap` memtable. When the memtable grows past its threshold, it flushes to a sorted SSTable with a sparse index and bloom filter. Reads check the memtable first, then SSTables from newest to oldest. Deletes are stored as tombstones until compaction cleans them up.
 
-Compaction is explicit and size-tiered. That keeps the implementation easier to reason about for this project: write a new merged table first, fsync and rename it, then remove the old tables. On startup, the engine reloads SSTables and replays the WAL, including recovery from an incomplete final WAL frame.
+By default, compaction runs automatically when four SSTables accumulate and merges them into one replacement table. The replacement is written and made durable before the old tables are removed. On startup, the engine reloads SSTables and replays the WAL, including recovery from an incomplete final WAL frame.
 
-The main tradeoff is read amplification: size-tiered compaction is simple, but leveled compaction would be better once many SSTables pile up.
+This full-merge strategy keeps the implementation simple, but leveled compaction would scale better with many SSTables.
 
 ## Observability
 
@@ -147,6 +155,9 @@ Run Prometheus and Grafana:
 ```bash
 docker compose -f observability/docker-compose.yml up
 ```
+
+The included Prometheus config scrapes the host through `host.docker.internal`, while the sample nodes bind metrics to `127.0.0.1`.
+If Docker cannot reach host loopback on your system, set `RAFT_KV_METRICS_ADDR` to a host-reachable address.
 
 Then start the three `raft-node` processes from the run section, write a few keys with `raft-client`, and kill the current leader. Grafana will be at <http://localhost:3000> with a preloaded `raft-kv live cluster` dashboard showing the role map, term, commit index, observed write rate, replication lag, and LSM compaction activity.
 
