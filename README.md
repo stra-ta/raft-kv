@@ -68,6 +68,8 @@ The simulator records the path from a steady leader to crash, election, and reco
 
 The generated timeline ([`docs/failover.svg`](docs/failover.svg)) and the explanatory story show different simulator traces, not one canonical node-by-node sequence.
 
+Open the self-contained [interactive trace explorer](docs/raft-explorer.html) to play, pause, step, and inspect deterministic election and failover samples.
+
 ![Failover story](docs/failover-story.svg)
 
 ## Replicated log

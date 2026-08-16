@@ -1,4 +1,5 @@
 use raft_kv::{ClientRequest, Cluster, Command, NodeId, Role};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -20,11 +21,19 @@ fn run() -> io::Result<()> {
 
     let election = election_trace();
     let failover = failover_trace();
+    let failover_svg = legacy_failover_trace();
     let replication = replication_table();
     let metrics = metrics_table();
 
     fs::write(docs.join("election.svg"), render_svg("Election", &election))?;
-    fs::write(docs.join("failover.svg"), render_svg("Failover", &failover))?;
+    fs::write(
+        docs.join("failover.svg"),
+        render_svg("Failover", &failover_svg),
+    )?;
+    fs::write(
+        docs.join("raft-explorer.html"),
+        render_explorer(&[("Election", &election), ("Failover", &failover)]),
+    )?;
     fs::write(docs.join("cluster-dashboard.svg"), render_dashboard_svg())?;
     fs::write(docs.join("failover-story.svg"), render_failover_story_svg())?;
     fs::write(docs.join("log-ledger.svg"), render_log_ledger_svg())?;
@@ -45,6 +54,24 @@ fn election_trace() -> Vec<Sample> {
 }
 
 fn failover_trace() -> Vec<Sample> {
+    let mut cluster = Cluster::new(5);
+    assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+    cluster.run_for(200);
+    let old_leader = cluster.leader().expect("leader");
+    cluster.stop(old_leader);
+    let mut samples = vec![sample(
+        &cluster,
+        cluster.now(),
+        Some(format!("kill node {old_leader}")),
+    )];
+    for _ in (50..=600).step_by(50) {
+        cluster.run_for(50);
+        samples.push(sample(&cluster, cluster.now(), None));
+    }
+    samples
+}
+
+fn legacy_failover_trace() -> Vec<Sample> {
     let mut cluster = Cluster::new(5);
     assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
     cluster.run_for(200);
@@ -84,6 +111,17 @@ fn sample(cluster: &Cluster, time_ms: u64, note: Option<String>) -> Sample {
         time_ms,
         roles,
         note,
+        nodes: cluster
+            .nodes()
+            .map(|(id, node)| NodeSample {
+                id,
+                term: node.current_term(),
+                log_len: node.log().len(),
+                commit: node.commit_index() as u64,
+                applied: node.last_applied() as u64,
+                stopped: cluster.is_stopped(id),
+            })
+            .collect(),
     }
 }
 
@@ -521,6 +559,104 @@ struct Sample {
     time_ms: u64,
     roles: Vec<(NodeId, Role)>,
     note: Option<String>,
+    nodes: Vec<NodeSample>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeSample {
+    id: NodeId,
+    term: u64,
+    log_len: usize,
+    commit: u64,
+    applied: u64,
+    stopped: bool,
+}
+
+fn render_explorer(scenarios: &[(&str, &[Sample])]) -> String {
+    let data = scenarios
+        .iter()
+        .map(|(name, samples)| {
+            format!(
+                "{{\"name\":\"{}\",\"samples\":[{}]}}",
+                json_escape(name),
+                samples
+                    .iter()
+                    .map(sample_json)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r##"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>raft-kv trace explorer</title><style>
+:root{{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--line:#30363d;--text:#e6e1d9;--muted:#8b949e;--green:#3fb950;--yellow:#d29922;--red:#f85149;--blue:#58a6ff}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px ui-monospace,SFMono-Regular,Menlo,monospace}}main{{max-width:1180px;margin:auto;padding:28px 20px}}h1{{font-size:24px;margin:0 0 6px}}p{{color:var(--muted);margin:0 0 22px}}.toolbar,.panel{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}}button,select,input{{font:inherit;color:var(--text);background:#21262d;border:1px solid var(--line);border-radius:7px;padding:7px 10px}}button{{cursor:pointer}}button:hover{{border-color:var(--blue)}}input{{vertical-align:middle;width:180px}}.summary{{display:flex;gap:24px;flex-wrap:wrap;color:var(--muted);margin-top:12px}}.summary b{{color:var(--text)}}.nodes{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}}.node{{border:1px solid var(--line);border-radius:10px;padding:12px;background:#11161d}}.node h2{{font-size:15px;margin:0 0 10px}}.role{{display:inline-block;border-radius:20px;padding:3px 8px;font-size:11px;font-weight:bold;color:#0f1115}}.leader{{background:var(--green)}}.candidate{{background:var(--yellow)}}.follower{{background:var(--muted)}}.stopped{{background:var(--red)}}.stats{{color:var(--muted);line-height:1.8}}.stats b{{color:var(--text)}}.events{{max-height:260px;overflow:auto}}.event{{padding:7px 0;border-bottom:1px solid #21262d}}.event:last-child{{border:0}}.event time{{color:var(--blue);display:inline-block;width:75px}}.legend{{color:var(--muted);font-size:12px}}
+</style></head><body><main><h1>raft-kv / trace explorer</h1><p>Deterministic simulator traces. Move through time to inspect role, term, log, commit, and failover causality.</p>
+<div class="toolbar"><label>Scenario <select id="scenario"></select></label> <button id="play">Play</button> <button id="step">Step</button> <button id="reset">Reset</button> <label>Speed <input id="speed" type="range" min="100" max="1600" value="600" step="100"></label><span id="speedLabel">600 ms/step</span><div class="summary"><span>time <b id="time">0 ms</b></span><span>sample <b id="position">0 / 0</b></span><span>event <b id="currentEvent">initial state</b></span></div></div>
+<section class="panel"><div id="nodes" class="nodes"></div></section><section class="panel"><h2>Causal events</h2><div id="events" class="events"></div><div class="legend">Terms advance during elections. Commit and applied indexes show majority progress and state-machine application.</div></section>
+</main><script>
+const traces=[{data}];let scenario=0,index=0,timer=null;
+const $=id=>document.getElementById(id), role=(name,stopped)=>stopped?'stopped':name.toLowerCase();
+const escapeHtml=text=>String(text).replace(/[&<>"']/g,char=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[char]));
+function eventFor(sample,previous){{if(sample.note)return sample.note;if(!previous)return'initial state';let changes=[];sample.nodes.forEach((node,i)=>{{let old=previous.nodes[i];if(node.stopped&&!old.stopped)changes.push('node-'+node.id+' stops');if(!node.stopped&&old.stopped)changes.push('node-'+node.id+' restarts');if(node.term>old.term)changes.push('node-'+node.id+' enters term '+node.term);if(node.log_len>old.log_len)changes.push('node-'+node.id+' appends log entry');if(node.commit>old.commit)changes.push('node-'+node.id+' commits through '+node.commit);}});return changes.join(' · ')||'heartbeats keep the cluster aligned';}}
+function render(){{let trace=traces[scenario],sample=trace.samples[index],previous=trace.samples[index-1];$('time').textContent=sample.time_ms+' ms';$('position').textContent=(index+1)+' / '+trace.samples.length;$('currentEvent').textContent=eventFor(sample,previous);$('nodes').innerHTML=sample.nodes.map((node,i)=>{{let roleName=sample.roles[i][1],label=node.stopped?'STOPPED':roleName.toUpperCase();return `<article class="node"><h2>node-${{node.id}} <span class="role ${{role(roleName,node.stopped)}}">${{label}}</span></h2><div class="stats">term <b>${{node.term}}</b><br>log <b>${{node.log_len}} entries</b><br>commit <b>${{node.commit}}</b><br>applied <b>${{node.applied}}</b></div></article>`}}).join('');$('events').innerHTML=trace.samples.slice(0,index+1).map((s,i)=>`<div class="event"><time>${{s.time_ms}} ms</time>${{escapeHtml(eventFor(s,trace.samples[i-1]))}}</div>`).reverse().join('');}}
+function reset(){{index=0;render()}}function step(){{if(index<traces[scenario].samples.length-1){{index++;render()}}else stop()}}function stop(){{if(timer){{clearInterval(timer);timer=null;$('play').textContent='Play'}}}}function schedule(){{if(timer){{clearInterval(timer);timer=setInterval(step,Number($('speed').value))}}}}function play(){{if(timer){{stop();return}}$('play').textContent='Pause';timer=setInterval(step,Number($('speed').value))}}
+traces.forEach((trace,i)=>$('scenario').add(new Option(trace.name,i)));$('scenario').onchange=()=>{{stop();scenario=Number($('scenario').value);reset()}};$('play').onclick=play;$('step').onclick=step;$('reset').onclick=()=>{{stop();reset()}};$('speed').oninput=e=>{{$('speedLabel').textContent=e.target.value+' ms/step';schedule()}};render();
+</script></body></html>
+"##
+    )
+}
+
+fn sample_json(sample: &Sample) -> String {
+    let roles = sample
+        .roles
+        .iter()
+        .map(|(id, role)| format!("[{},\"{:?}\"]", id, role))
+        .collect::<Vec<_>>()
+        .join(",");
+    let nodes = sample
+        .nodes
+        .iter()
+        .map(|node| format!("{{\"id\":{},\"term\":{},\"log_len\":{},\"commit\":{},\"applied\":{},\"stopped\":{}}}", node.id, node.term, node.log_len, node.commit, node.applied, node.stopped))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"time_ms\":{},\"roles\":[{}],\"nodes\":[{}],\"note\":{}}}",
+        sample.time_ms,
+        roles,
+        nodes,
+        sample
+            .note
+            .as_deref()
+            .map(|note| format!("\"{}\"", json_escape(note)))
+            .unwrap_or_else(|| "null".to_string())
+    )
+}
+
+fn json_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            character if character.is_control() => {
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn render_svg(title: &str, samples: &[Sample]) -> String {
@@ -610,4 +746,109 @@ fn replace_section(readme: &str, name: &str, content: &str) -> String {
     let before = &readme[..start_index + start.len()];
     let after = &readme[end_index..];
     format!("{before}\n{}\n{after}", content.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    #[test]
+    fn explorer_contains_both_scenarios_and_controls() {
+        let election = election_trace();
+        let failover = failover_trace();
+        let html = render_explorer(&[("Election", &election), ("Failover", &failover)]);
+
+        assert!(html.starts_with("<!doctype html>"));
+        assert_eq!(html.matches("<script>").count(), 1);
+        assert_eq!(html.matches("</script>").count(), 1);
+        assert!(html.contains("\"name\":\"Election\""));
+        assert!(html.contains("\"name\":\"Failover\""));
+        assert!(html.contains("id=\"play\""));
+        assert!(html.contains("id=\"speed\""));
+        assert!(!html.contains("<script src="));
+        assert!(!html.contains("<link rel=\"stylesheet\""));
+    }
+
+    #[test]
+    fn failover_trace_records_real_stop_state_and_monotonic_time() {
+        let samples = failover_trace();
+        assert!(
+            samples
+                .windows(2)
+                .all(|window| { window[0].time_ms < window[1].time_ms })
+        );
+        assert!(samples[0].nodes.iter().any(|node| node.stopped));
+        assert!(
+            samples[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("kill node"))
+        );
+        assert!(samples.iter().skip(1).any(|sample| {
+            sample
+                .nodes
+                .iter()
+                .any(|node| node.term > samples[0].nodes[node.id].term)
+        }));
+    }
+
+    #[test]
+    fn json_escape_covers_embedded_string_delimiters() {
+        assert_eq!(
+            json_escape("quote\" slash\\ line\nreturn\r tab\t </script>\u{2028}"),
+            "quote\\\" slash\\\\ line\\nreturn\\r tab\\t \\u003c/script\\u003e\\u2028"
+        );
+    }
+
+    #[test]
+    fn generated_explorer_passes_paused_speed_runtime_probe() {
+        let election = election_trace();
+        let failover = failover_trace();
+        let html = render_explorer(&[("Election", &election), ("Failover", &failover)]);
+        let script = r#"
+const fs = require('fs'), vm = require('vm');
+const html = fs.readFileSync(0, 'utf8');
+const source = html.match(/<script>([\s\S]*)<\/script>/)[1];
+const elements = new Map();
+for (const id of ['scenario', 'play', 'step', 'reset', 'speed', 'speedLabel', 'time', 'position', 'currentEvent', 'nodes', 'events']) elements.set(id, {value: id === 'speed' ? '600' : '', textContent: id === 'play' ? 'Play' : '', innerHTML: '', options: [], add(option) { this.options.push(option); }});
+const timers = new Set();
+const context = {document: {getElementById: id => elements.get(id)}, Option: function(text, value) { return {text, value}; }, setInterval(fn, ms) { const timer = {ms}; timers.add(timer); return timer; }, clearInterval(timer) { timers.delete(timer); }};
+vm.runInNewContext(source, context);
+if (timers.size !== 0 || elements.get('play').textContent !== 'Play') throw new Error('not paused at initialization');
+elements.get('speed').value = '1000';
+elements.get('speed').oninput({target: elements.get('speed')});
+if (timers.size !== 0 || elements.get('play').textContent !== 'Play') throw new Error('paused speed change started playback');
+elements.get('play').onclick();
+if (timers.size !== 1 || [...timers][0].ms !== 1000 || elements.get('play').textContent !== 'Pause') throw new Error('play state inconsistent');
+console.log('paused speed runtime probe passed');
+"#;
+        let mut child = match ProcessCommand::new("node")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping explorer runtime probe: Node.js is not installed");
+                return;
+            }
+            Err(error) => panic!("failed to start Node.js explorer runtime probe: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(html.as_bytes())
+            .expect("write explorer HTML to node");
+        let output = child.wait_with_output().expect("wait for node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
