@@ -11,6 +11,28 @@ A learning implementation of the Raft consensus algorithm in Rust, with a determ
 
 ![Cluster dashboard](docs/cluster-dashboard.svg)
 
+## Quickstart
+
+Start a three-node cluster in separate terminals:
+
+```bash
+cargo run --bin raft-node -- 0 ./data/node0.bin \
+  0=127.0.0.1:5000 1=127.0.0.1:5001 2=127.0.0.1:5002
+
+cargo run --bin raft-node -- 1 ./data/node1.bin \
+  0=127.0.0.1:5000 1=127.0.0.1:5001 2=127.0.0.1:5002
+
+cargo run --bin raft-node -- 2 ./data/node2.bin \
+  0=127.0.0.1:5000 1=127.0.0.1:5001 2=127.0.0.1:5002
+```
+
+Write and read a key:
+
+```bash
+cargo run --bin raft-client -- 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002 set foo bar
+cargo run --bin raft-client -- 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002 get foo
+```
+
 ## What this is
 
 A from-scratch Raft core that understands leader election, log replication, majority commit, and crash recovery. It can run in a deterministic discrete-event simulator (fake time, in-memory messages, injectable partitions and stops) or as real TCP processes with bincode framing and atomic disk persistence.
@@ -44,23 +66,12 @@ A from-scratch Raft core that understands leader election, log replication, majo
 - no TLS or authentication
 - `/metrics` has no authentication; bind it to localhost for local demos
 - reads require the leader to have committed at least one entry in its current term (basic read-safety check, not full read-index)
-- no connection keep-alive — each send cycle opens fresh TCP connections
+- no connection keep-alive - each send cycle opens fresh TCP connections
 - no range scans or multi-column-family storage; the LSM is point-read/write only
 
 ## Shape of the system
 
-```mermaid
-flowchart LR
-    C[client] --> A[any node]
-    A -- reject + leader hint --> C
-    A -- accept if leader --> L[leader]
-    C --> L
-    L --> F1[follower]
-    L --> F2[follower]
-    L --> F3[follower]
-    L --> F4[follower]
-    L -. majority commit .-> S[(KV state machine)]
-```
+![Raft request and replication flow](docs/system-shape.svg)
 
 ## Failover story
 
@@ -179,3 +190,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 The simulator includes Rust equivalents of the 6.824 tests: `TestInitialElection`, `TestReElection`, `TestBasicAgree`, `TestFailAgree`, `TestFailNoAgree`, `TestConcurrentStarts`, and `TestRejoin`.
 
 The suite also covers persistence, frame encoding, metrics, and real TCP process integration tests including leader kill/restart and full-cluster crash recovery.
+
+## Documentation
+
+- [`docs/replication.md`](docs/replication.md): replicated-log and snapshot details.
+- [`docs/system-shape.svg`](docs/system-shape.svg): client routing, leader replication, and majority commit.
+- [`docs/metrics.md`](docs/metrics.md): metrics definitions and generated dashboard data.
+- [`docs/election.svg`](docs/election.svg): election timeline.
+- [`docs/failover.svg`](docs/failover.svg): deterministic failover flow.
+- [`docs/failover-story.svg`](docs/failover-story.svg): failover trace illustration.
+- [`docs/log-ledger.svg`](docs/log-ledger.svg): replicated log view.
+- [`docs/raft-explorer.html`](docs/raft-explorer.html): interactive deterministic trace explorer.
