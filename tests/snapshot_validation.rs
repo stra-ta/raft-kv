@@ -8,7 +8,10 @@ fn valid_snapshot() -> Snapshot {
         state: StateSnapshot {
             version: SNAPSHOT_FORMAT_VERSION,
             last_applied: 2,
-            data: vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())],
+            data: vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ],
         },
     }
 }

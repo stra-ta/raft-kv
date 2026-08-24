@@ -272,11 +272,13 @@ impl<S: StateMachine> Node<S> {
             Rpc::InstallSnapshot(snapshot) => vec![Message {
                 from: self.id,
                 to: from,
-                rpc: Rpc::InstallSnapshotReply(self.handle_install_snapshot(
-                    from, snapshot, now_ms,
-                )),
+                rpc: Rpc::InstallSnapshotReply(
+                    self.handle_install_snapshot(from, snapshot, now_ms),
+                ),
             }],
-            Rpc::InstallSnapshotReply(reply) => self.handle_install_snapshot_reply(from, reply, now_ms),
+            Rpc::InstallSnapshotReply(reply) => {
+                self.handle_install_snapshot_reply(from, reply, now_ms)
+            }
         }
     }
 

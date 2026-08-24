@@ -1,6 +1,6 @@
 # raft-kv
 
-[![CI](https://github.com/wheevu/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/wheevu/raft-kv/actions/workflows/ci.yml)
+[![CI](https://github.com/stra-ta/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/stra-ta/raft-kv/actions/workflows/ci.yml)
 
 A learning implementation of the Raft consensus algorithm in Rust, with a deterministic simulator and a real process runner over raw TCP. Not a production database.
 
