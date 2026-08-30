@@ -40,6 +40,22 @@ pub struct RequestVoteReply {
     pub vote_granted: bool,
 }
 
+/// A pre-vote probes whether a candidate could win an election without
+/// advancing the receiver's persistent term.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PreVote {
+    pub term: Term,
+    pub candidate_id: NodeId,
+    pub last_log_index: LogIndex,
+    pub last_log_term: Term,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PreVoteReply {
+    pub term: Term,
+    pub vote_granted: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppendEntries {
     pub term: Term,
@@ -131,6 +147,14 @@ pub enum Rpc {
     AppendEntriesReply(AppendEntriesReply),
     InstallSnapshot(Snapshot),
     InstallSnapshotReply(InstallSnapshotReply),
+    PreVote(PreVote),
+    PreVoteReply(PreVoteReply),
+    InstallSnapshotRequest(InstallSnapshotRequest),
+    ReadIndex(ReadIndex),
+    ReadIndexReply(ReadIndexReply),
+    TimeoutNow(TimeoutNow),
+    InstallSnapshotChunk(InstallSnapshotChunk),
+    InstallSnapshotChunkReply(InstallSnapshotChunkReply),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -138,6 +162,56 @@ pub struct InstallSnapshotReply {
     pub term: Term,
     pub accepted: bool,
     pub last_included_index: LogIndex,
+}
+
+/// Metadata-bearing snapshot request used by current process runners. The
+/// legacy `InstallSnapshot(Snapshot)` variant remains available for old
+/// simulator fixtures and callers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstallSnapshotRequest {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub snapshot: Snapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReadIndex {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub request_id: u64,
+    pub commit_index: LogIndex,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReadIndexReply {
+    pub term: Term,
+    pub request_id: u64,
+    pub applied_index: LogIndex,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TimeoutNow {
+    pub term: Term,
+    pub leader_id: NodeId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstallSnapshotChunk {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub snapshot_id: u64,
+    pub offset: usize,
+    pub total_size: usize,
+    pub data: Vec<u8>,
+    pub done: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstallSnapshotChunkReply {
+    pub term: Term,
+    pub snapshot_id: u64,
+    pub accepted: bool,
+    pub next_offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

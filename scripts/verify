@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+cargo test --all-targets --all-features --locked

@@ -13,12 +13,17 @@ pub use cluster::{Cluster, FaultPlan, LifecycleAction, ScheduledFault};
 pub use history::{
     HistoryOperation, LinearizabilityViolation, OperationHistory, check_linearizable,
 };
-pub use node::{Node, PendingWrite, SnapshotInstallResult};
+pub use node::{
+    MAX_APPEND_ENTRIES, Node, PendingRead, PendingWrite, SNAPSHOT_CHUNK_BYTES,
+    SnapshotInstallResult,
+};
 pub use state_machine::{MemoryStateMachine, StateMachine};
 pub use types::{
-    AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, InstallSnapshotReply,
-    LogEntry, LogIndex, Message, NodeId, RequestVote, RequestVoteReply, Role, Rpc,
-    SNAPSHOT_FORMAT_VERSION, Snapshot, StateSnapshot, Term,
+    AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, InstallSnapshotChunk,
+    InstallSnapshotChunkReply, InstallSnapshotReply, InstallSnapshotRequest, LogEntry, LogIndex,
+    Message, NodeId, PreVote, PreVoteReply, ReadIndex, ReadIndexReply, RequestVote,
+    RequestVoteReply, Role, Rpc, SNAPSHOT_FORMAT_VERSION, Snapshot, StateSnapshot, Term,
+    TimeoutNow,
 };
 
 #[cfg(test)]

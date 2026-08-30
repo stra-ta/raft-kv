@@ -270,6 +270,9 @@ impl Cluster {
         ) {
             return self.propose_write(leader, request);
         }
+        if matches!(request, ClientRequest::Get { .. }) {
+            return self.propose_read(leader, request);
+        }
         let (reply, messages) = self
             .nodes
             .get_mut(&leader)
@@ -277,6 +280,57 @@ impl Cluster {
             .handle_client_request(request);
         self.enqueue(messages);
         reply
+    }
+
+    fn propose_read(&mut self, leader: NodeId, request: ClientRequest) -> ClientReply {
+        let key = match request {
+            ClientRequest::Get { key } => key,
+            ClientRequest::LocalGet { .. }
+            | ClientRequest::Set { .. }
+            | ClientRequest::Delete { .. } => {
+                return ClientReply {
+                    success: false,
+                    leader_id: self.node(leader).leader_id(),
+                    response: None,
+                };
+            }
+        };
+        let (read, messages) = match self.nodes.get_mut(&leader).unwrap().start_client_read() {
+            Ok(read) => read,
+            Err(reply) => return reply,
+        };
+        self.enqueue(messages);
+        let deadline = self.now_ms + CLIENT_WRITE_TIMEOUT_MS;
+        while self.now_ms <= deadline {
+            let node = self.node(leader);
+            if node.read_committed_and_applied(read) {
+                let response = node.read_value(&key).ok().flatten();
+                self.nodes.get_mut(&leader).unwrap().finish_read(read);
+                return ClientReply {
+                    success: true,
+                    leader_id: Some(leader),
+                    response,
+                };
+            }
+            if node.role() != Role::Leader
+                || node.current_term() != read.term
+                || self.is_stopped_internal(leader)
+            {
+                self.nodes.get_mut(&leader).unwrap().finish_read(read);
+                return ClientReply {
+                    success: false,
+                    leader_id: self.leader(),
+                    response: None,
+                };
+            }
+            self.step();
+        }
+        self.nodes.get_mut(&leader).unwrap().finish_read(read);
+        ClientReply {
+            success: false,
+            leader_id: self.node(leader).leader_id(),
+            response: None,
+        }
     }
 
     fn propose_write(&mut self, leader: NodeId, request: ClientRequest) -> ClientReply {

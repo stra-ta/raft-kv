@@ -1,5 +1,5 @@
 use crate::state_machine::StateMachine;
-use crate::{Command, LogIndex};
+use crate::{Command, LogIndex, SNAPSHOT_FORMAT_VERSION, StateSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -355,11 +355,97 @@ impl StateMachine for LsmTree {
     fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
+
+    fn snapshot(&self) -> io::Result<StateSnapshot> {
+        let visible = self.visible_records()?;
+        let data = visible
+            .into_iter()
+            .filter_map(|(key, (value, _))| value.map(|value| (key, value)))
+            .collect();
+        Ok(StateSnapshot {
+            version: SNAPSHOT_FORMAT_VERSION,
+            last_applied: self.last_applied,
+            data,
+        })
+    }
+
+    fn restore_snapshot(&mut self, snapshot: &StateSnapshot) -> io::Result<()> {
+        if snapshot.version != SNAPSHOT_FORMAT_VERSION
+            || snapshot.data.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid LSM state snapshot",
+            ));
+        }
+        if snapshot.last_applied < self.last_applied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot restore an older LSM state snapshot",
+            ));
+        }
+
+        // Write a replacement table before changing the in-memory table list.
+        // The replacement also carries tombstones for keys that existed in an
+        // older table but not in the incoming snapshot. This keeps a crash
+        // between table publication and old-table deletion from resurrecting
+        // deleted keys during restart.
+        let existing = self.visible_records()?;
+        let mut records: BTreeMap<String, Option<String>> = existing
+            .into_iter()
+            .map(|(key, (value, _))| (key, value))
+            .collect();
+        for (key, value) in &snapshot.data {
+            records.insert(key.clone(), Some(value.clone()));
+        }
+        for (key, value) in records.iter_mut() {
+            if !snapshot
+                .data
+                .iter()
+                .any(|(snapshot_key, _)| snapshot_key == key)
+            {
+                *value = None;
+            }
+        }
+        let entries: Vec<_> = records
+            .into_iter()
+            .map(|(key, value)| DataEntry {
+                index: snapshot.last_applied,
+                record: Record { key, value },
+            })
+            .collect();
+        let replacement = write_table(&self.dir, self.next_table_id(), &entries)?;
+        self.reset_wal()?;
+        let old_tables = std::mem::replace(&mut self.tables, vec![replacement]);
+        self.memtable.clear();
+        self.memtable_bytes = 0;
+        self.last_applied = snapshot.last_applied;
+        for table in old_tables {
+            let _ = fs::remove_file(table.path);
+        }
+        sync_dir(&self.dir);
+        Ok(())
+    }
 }
 
 impl LsmTree {
     pub fn get_mut(&mut self, key: &str) -> io::Result<Option<String>> {
         Ok(self.get_record(key)?.flatten())
+    }
+
+    fn visible_records(&self) -> io::Result<BTreeMap<String, (Option<String>, LogIndex)>> {
+        let mut records = BTreeMap::new();
+        // Tables are kept newest-first. Applying oldest first means a newer
+        // table naturally overwrites an older value for the same key.
+        for table in self.tables.iter().rev() {
+            for entry in read_all_entries(&table.path)? {
+                records.insert(entry.record.key.clone(), (entry.record.value, entry.index));
+            }
+        }
+        for (key, (value, index)) in &self.memtable {
+            records.insert(key.clone(), (value.clone(), *index));
+        }
+        Ok(records)
     }
 
     fn read_only_clone(&self) -> io::Result<Self> {
@@ -774,6 +860,68 @@ mod tests {
             assert!(path.exists());
         }
         let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
+        assert_eq!(tree.get_mut("k").unwrap(), Some("new".into()));
+    }
+
+    #[test]
+    fn snapshot_and_restore_preserve_values_and_tombstones() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut source = LsmTree::open(source_dir.path(), opts()).unwrap();
+        source
+            .apply(
+                1,
+                &Command::Set {
+                    key: "keep".into(),
+                    value: "value".into(),
+                },
+            )
+            .unwrap();
+        source
+            .apply(
+                2,
+                &Command::Set {
+                    key: "gone".into(),
+                    value: "temporary".into(),
+                },
+            )
+            .unwrap();
+        source
+            .apply(3, &Command::Delete { key: "gone".into() })
+            .unwrap();
+        let snapshot = StateMachine::snapshot(&source).unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut target = LsmTree::open(target_dir.path(), opts()).unwrap();
+        target.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(target.last_applied(), 3);
+        assert_eq!(target.get_mut("keep").unwrap(), Some("value".into()));
+        assert_eq!(target.get_mut("gone").unwrap(), None);
+
+        let reopened = LsmTree::open(target_dir.path(), opts()).unwrap();
+        assert_eq!(reopened.last_applied(), 3);
+    }
+
+    #[test]
+    fn older_snapshot_is_rejected_without_mutating_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = LsmTree::open(dir.path(), opts()).unwrap();
+        tree.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "new".into(),
+            },
+        )
+        .unwrap();
+        let old = StateSnapshot {
+            version: SNAPSHOT_FORMAT_VERSION,
+            last_applied: 0,
+            data: vec![("k".into(), "old".into())],
+        };
+        assert_eq!(
+            tree.restore_snapshot(&old).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
         assert_eq!(tree.get_mut("k").unwrap(), Some("new".into()));
     }
 }
