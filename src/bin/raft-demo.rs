@@ -44,7 +44,7 @@ fn run() -> io::Result<()> {
     )?;
     fs::write(docs.join("replication.md"), &replication)?;
     fs::write(docs.join("metrics.md"), &metrics)?;
-    update_readme("README.md", &replication, &metrics)?;
+    update_readme("GUIDE.md", &replication, &metrics)?;
     Ok(())
 }
 
