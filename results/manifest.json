@@ -1,0 +1,50 @@
+{
+  "schema": "stra-ta/results-manifest/v1",
+  "campaign_id": "pilot-raft-kv-evidence-r1-20260830",
+  "experiment_kind": "pilot",
+  "source": {
+    "repository": "stra-ta/raft-kv",
+    "commit": "c7696a423ce2367886fdbd0b276ea7283b1d665b",
+    "dirty": false,
+    "tracked_diff_sha256": null,
+    "dependencies": {}
+  },
+  "machine": {
+    "os": "Darwin",
+    "kernel": "Darwin 24.5.0",
+    "kernel_cmdline": null,
+    "cpu": "Apple M1",
+    "microcode": null,
+    "architecture": "arm64",
+    "numa": null,
+    "governor": null,
+    "turbo": null,
+    "virtualization": "host-or-undetected",
+    "container": "none-detected"
+  },
+  "build": {
+    "compiler": "Apple Clang 21.0.0",
+    "build_type": "Release"
+  },
+  "execution": {
+    "argv": [
+      "echo",
+      "manifest-example"
+    ],
+    "cwd": "/Users/nguyenhuyvu/projects/stra-ta/raft-kv",
+    "seeds": {
+      "seed": 42
+    }
+  },
+  "artifacts": [
+    {
+      "path": "results/example/raw/example.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "role": "raw"
+    }
+  ],
+  "notes": [
+    "example manifest \u2014 replace with real campaign before claiming performance"
+  ]
+}
