@@ -595,3 +595,122 @@ fn metrics_addr(self_addr: &str) -> io::Result<Option<SocketAddr>> {
     addr.set_port(port);
     Ok(Some(addr))
 }
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use raft_kv::net::{WireMessage, read_frame};
+    use raft_kv::{AppendEntries, Rpc};
+
+    fn heartbeat(from: NodeId, to: NodeId) -> raft_kv::Message {
+        raft_kv::Message {
+            from,
+            to,
+            rpc: Rpc::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: from,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        }
+    }
+
+    fn read_peer(stream: &mut TcpStream) -> raft_kv::Message {
+        match read_frame(stream).expect("peer frame") {
+            WireMessage::Peer(message) => message,
+            unexpected => panic!("expected peer frame, got {unexpected:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_worker_reuses_one_connection_across_send_cycles() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || peer_worker(1, addr, receiver));
+        sender.send(heartbeat(0, 1)).unwrap();
+        sender.send(heartbeat(0, 1)).unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        for _ in 0..2 {
+            let message = read_peer(&mut stream);
+            assert_eq!((message.from, message.to), (0, 1));
+        }
+
+        // A healthy peer keeps its connection: no fresh connection per cycle.
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        match listener.accept() {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("peer worker opened a fresh connection per send cycle"),
+            Err(err) => panic!("unexpected accept error: {err}"),
+        }
+        drop(sender);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn peer_queue_full_defers_without_blocking() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut senders = HashMap::new();
+        senders.insert(1, sender);
+        let transport = PeerTransport {
+            senders: Arc::new(senders),
+        };
+        transport.enqueue(heartbeat(0, 1));
+        // The bounded queue must not block the Raft thread: the overflow is
+        // deferred to the next heartbeat, which rebuilds replication state.
+        transport.enqueue(heartbeat(0, 1));
+        let first = receiver
+            .try_recv()
+            .expect("the first message fits the bound");
+        assert_eq!((first.from, first.to), (0, 1));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the overflow is deferred, not queued behind the bound"
+        );
+    }
+
+    #[test]
+    fn peer_worker_reconnects_after_failure_and_delivers() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || peer_worker(1, addr, receiver));
+        sender.send(heartbeat(0, 1)).unwrap();
+
+        let listener = loop {
+            match TcpListener::bind(addr) {
+                Ok(listener) => break listener,
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("bind failed: {err}"),
+            }
+        };
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            if let Ok(accepted) = listener.accept() {
+                break accepted;
+            }
+            if Instant::now() > deadline {
+                panic!("peer worker never reconnected after failure");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let message = read_peer(&mut stream);
+        assert_eq!((message.from, message.to), (0, 1));
+        drop(sender);
+        handle.join().unwrap();
+    }
+}

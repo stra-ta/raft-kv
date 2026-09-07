@@ -278,3 +278,67 @@ fn compacted_leader_transfers_a_snapshot_to_a_restarted_follower() {
         cluster.node(follower).get("offline") == Some("restored".to_string())
     }));
 }
+
+fn set_commands_in_log_order(node: &Node) -> Vec<(String, String)> {
+    node.log()
+        .iter()
+        .filter_map(|entry| match &entry.command {
+            raft_kv::Command::Set { key, value } => Some((key.clone(), value.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn sequential_writes_replicate_in_fifo_order_on_every_node() {
+    // Deterministic analogue of the transport FIFO pin: under the default
+    // fault-free plan, per-peer messages arrive in send order, so every
+    // node's replicated log carries the same ordered write sequence.
+    let mut cluster = Cluster::new(3);
+    assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+    let leader = cluster.leader().unwrap();
+    for i in 0..3 {
+        let reply = cluster.propose(
+            leader,
+            ClientRequest::Set {
+                key: format!("fifo-{i}"),
+                value: format!("v{i}"),
+            },
+        );
+        assert!(reply.success);
+    }
+    let reference = set_commands_in_log_order(cluster.node(leader));
+    assert!(cluster.run_until(2_000, |cluster| {
+        cluster
+            .nodes()
+            .all(|(_, node)| set_commands_in_log_order(node) == reference)
+    }));
+}
+
+#[test]
+fn healed_partition_lets_a_follower_catch_up_like_a_reconnected_peer() {
+    // Deterministic analogue of the TCP reconnect pin: a peer cut off from
+    // the leader misses replication, then catches up once the link heals.
+    let mut cluster = Cluster::new(3);
+    assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+    let leader = cluster.leader().unwrap();
+    let follower = cluster
+        .node_ids()
+        .find(|&id| id != leader)
+        .expect("follower");
+    let others: Vec<_> = cluster.node_ids().filter(|&id| id != follower).collect();
+    assert!(others.contains(&leader));
+    cluster.partition(&[others, vec![follower]]);
+    let reply = cluster.propose(
+        leader,
+        ClientRequest::Set {
+            key: "partitioned".to_string(),
+            value: "away".to_string(),
+        },
+    );
+    assert!(reply.success);
+    cluster.heal();
+    assert!(cluster.run_until(3_000, |cluster| {
+        cluster.node(follower).get("partitioned") == Some("away".to_string())
+    }));
+}

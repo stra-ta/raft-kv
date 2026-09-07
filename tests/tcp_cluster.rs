@@ -1,6 +1,8 @@
 use raft_kv::net::{WireMessage, read_frame, write_frame};
+use raft_kv::storage::PersistedState;
 use raft_kv::{ClientReply, ClientRequest, NodeId};
 use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -96,6 +98,16 @@ fn spawn_node(
     peers: &HashMap<NodeId, String>,
     metrics: &HashMap<NodeId, String>,
 ) -> Child {
+    spawn_node_with_env(dir, id, peers, metrics, &[])
+}
+
+fn spawn_node_with_env(
+    dir: &Path,
+    id: NodeId,
+    peers: &HashMap<NodeId, String>,
+    metrics: &HashMap<NodeId, String>,
+    extra_env: &[(&str, &str)],
+) -> Child {
     let mut args = vec![
         id.to_string(),
         dir.join(format!("node-{id}.bin")).display().to_string(),
@@ -106,13 +118,16 @@ fn spawn_node(
         .collect();
     peer_args.sort();
     args.extend(peer_args);
-    ProcessCommand::new(env!("CARGO_BIN_EXE_raft-node"))
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_raft-node"));
+    command
         .args(args)
         .env("RAFT_KV_METRICS_ADDR", &metrics[&id])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.spawn().unwrap()
 }
 
 fn wait_for_leader(peers: &HashMap<NodeId, String>, timeout: Duration) -> Option<NodeId> {
@@ -324,4 +339,73 @@ fn wait_for_metrics(addr: &str, timeout: Duration) -> Option<String> {
         thread::sleep(Duration::from_millis(50));
     }
     None
+}
+
+const PERSISTENCE_MAGIC: &[u8; 8] = b"RKVPST02";
+
+fn persisted_snapshot_index(dir: &Path, id: NodeId) -> Option<usize> {
+    let bytes = fs::read(dir.join(format!("node-{id}.bin"))).ok()?;
+    let payload = bytes.strip_prefix(PERSISTENCE_MAGIC)?;
+    let state: PersistedState = bincode::deserialize(payload).ok()?;
+    state.snapshot.map(|snapshot| snapshot.last_included_index)
+}
+
+#[test]
+fn small_snapshot_threshold_auto_compacts_through_persist_if_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let peers = reserve_ports(3);
+    let metrics = reserve_ports(3);
+    let children: HashMap<NodeId, Child> = peers
+        .keys()
+        .copied()
+        .map(|id| {
+            (
+                id,
+                spawn_node_with_env(
+                    dir.path(),
+                    id,
+                    &peers,
+                    &metrics,
+                    &[("RAFT_KV_SNAPSHOT_THRESHOLD", "2")],
+                ),
+            )
+        })
+        .collect();
+
+    let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
+    for i in 0..4 {
+        let reply = send_client(
+            &peers[&leader],
+            ClientRequest::Set {
+                key: format!("snap-key-{i}"),
+                value: format!("snap-value-{i}"),
+            },
+        )
+        .expect("set through leader");
+        assert!(reply.success);
+    }
+    assert_eq!(
+        wait_for_get(&peers, "snap-key-3", Duration::from_secs(5)),
+        Some("snap-value-3".to_string())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot_index = loop {
+        if let Some(index) = persisted_snapshot_index(dir.path(), leader) {
+            break index;
+        }
+        if Instant::now() > deadline {
+            panic!("leader never auto-compacted below the small threshold");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        snapshot_index >= 2,
+        "snapshot boundary should advance past the threshold, got {snapshot_index}"
+    );
+
+    for (_, mut child) in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

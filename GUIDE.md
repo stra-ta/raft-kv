@@ -51,7 +51,7 @@ A from-scratch Raft core that understands leader election, log replication, majo
 - seeded simulator fault plans with delay, drop, duplicate, reorder, and lifecycle faults
 - operation histories with a deterministic linearizability checker and minimized counterexamples
 - length-prefixed `bincode` frames over raw TCP
-- batched outbound messages per peer (one TCP connection per destination per send cycle)
+- batched outbound messages per peer over one persistent TCP connection per destination while that peer is healthy, reconnecting with backoff after failures
 - atomic persistence: term, vote, log, and commit index via temp-file fsync + rename
 - committed commands apply into a disk-backed LSM-tree state machine
 - LSM write-ahead log, memtable flushes, SSTables with sparse indexes, bloom filters, tombstones, and explicit compaction
@@ -60,13 +60,13 @@ A from-scratch Raft core that understands leader election, log replication, majo
 
 ## Current limitations
 
-- snapshots and log compaction are opt-in; the built-in snapshot state machine is the in-memory simulator
+- snapshots and log compaction are explicit in the simulator (`compact_node`) but automatic on real nodes: `persist_if_changed` compacts to the last applied index once the applied-since-snapshot gap reaches `RAFT_KV_SNAPSHOT_THRESHOLD` (default 64; see dissertation Section 6.4)
 - simulator `stop`/`restart` faults pause and resume the same in-memory node; durable crash recovery is covered separately by the process-level TCP tests
 - no dynamic membership changes
 - no TLS or authentication
 - `/metrics` has no authentication; bind it to localhost for local demos
-- reads require the leader to have committed at least one entry in its current term (basic read-safety check, not full read-index)
-- no connection keep-alive - each send cycle opens fresh TCP connections
+- reads run a ReadIndex quorum barrier: the leader waits for a majority to acknowledge its term and for the barrier index to commit and apply in that term before serving the read (see dissertation Section 6.4)
+- peer connections persist while healthy; bounded per-peer queues defer overflow to the next heartbeat instead of blocking the Raft thread
 - no range scans or multi-column-family storage; the LSM is point-read/write only
 
 ## Shape of the system

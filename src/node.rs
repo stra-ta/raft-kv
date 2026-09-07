@@ -257,10 +257,6 @@ impl<S: StateMachine> Node<S> {
     pub fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
-    pub fn can_serve_reads(&self) -> bool {
-        self.commit_index >= self.term_start_index
-    }
-
     /// Starts a ReadIndex barrier. The caller must wait for
     /// `read_committed_and_applied` before observing the state machine. This
     /// keeps the public read path linearizable even when a leader has not yet
