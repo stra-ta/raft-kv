@@ -621,6 +621,7 @@ struct NodeSample {
 struct Scenario {
     name: &'static str,
     description: &'static str,
+    watch: &'static str,
     samples: Vec<Sample>,
 }
 
@@ -774,7 +775,7 @@ fn committed_write(
     trace.send_client(
         cluster,
         label,
-        format!("client sends {label} to node-{leader}"),
+        format!("client asks node-{leader} to {label}"),
     );
     let Ok(write) = cluster.begin_write(leader, request) else {
         trace.finish_client(
@@ -803,7 +804,7 @@ fn committed_write(
         cluster,
         ClientStatus::Committed,
         None,
-        format!("a majority stored {label}; node-{leader} applied it at index {index} and answered the client"),
+        format!("more than half the machines hold {label}, so it is committed; node-{leader} applied it and answered the client"),
     );
     let deadline = cluster.now() + 1_000;
     let applied_everywhere = trace.run_until(cluster, deadline, |cluster| {
@@ -814,7 +815,7 @@ fn committed_write(
     if applied_everywhere {
         trace.note(
             cluster,
-            format!("all five nodes have applied {label} to their own state machines"),
+            format!("all five machines have applied {label} to their own data"),
         );
     }
     true
@@ -825,7 +826,7 @@ fn election_scenario() -> Scenario {
     let mut trace = Trace::new(&cluster);
     trace.start(
         &cluster,
-        "five followers, no leader; every election timer is running",
+        "five machines, no leader, each one waiting for a different random time",
     );
     let elected = trace.run_until(&mut cluster, 600, |cluster| cluster.leader().is_some());
     if elected {
@@ -833,19 +834,20 @@ fn election_scenario() -> Scenario {
         let term = cluster.node(leader).current_term();
         trace.note(
             &cluster,
-            format!("node-{leader} wins a majority and becomes leader in term {term}"),
+            format!("node-{leader} wins the vote and becomes leader (term {term})"),
         );
         trace.run_for(&mut cluster, 150);
         if cluster.nodes().all(|(_, node)| node.last_applied() >= 1) {
             trace.note(
                 &cluster,
-                "the leader's noop entry has committed and been applied on every node",
+                "the leader's blank entry is committed and applied on every machine",
             );
         }
     }
     Scenario {
         name: "Election",
-        description: "Five followers with no leader. The first node to time out asks for votes and wins a majority in a new term.",
+        description: "With no leader, nothing can be decided. Each machine waits a random amount of time, then asks the others to vote for it, and whoever gets votes from more than half the machines leads the next term. Rounds never overlap: a machine that sees a higher term accepts it immediately.",
+        watch: "the first machine to give up waiting, each vote it collects, and the blank entry the winner writes to mark its term.",
         samples: trace.samples,
     }
 }
@@ -864,7 +866,7 @@ fn write_scenario() -> Scenario {
     let mut trace = Trace::new(&cluster);
     trace.start(
         &cluster,
-        format!("node-{leader} leads; the election noop is committed and applied everywhere"),
+        format!("node-{leader} leads; its first blank entry is committed and applied everywhere"),
     );
     assert!(
         committed_write(
@@ -878,7 +880,8 @@ fn write_scenario() -> Scenario {
     );
     Scenario {
         name: "Write",
-        description: "A client sends set foo=bar to the leader. The entry reaches the log, replicates, commits once a majority holds it, and every node applies it to its own data.",
+        description: "A client asks the leader to set foo to bar. The leader writes the request into its own log first, then tells the others to copy it. The entry is committed once more than half the machines hold it, meaning the decision can never be undone, and every machine then applies it to its own data.",
+        watch: "the same entry spreading through all five logs, then turning committed, then applied.",
         samples: trace.samples,
     }
 }
@@ -891,7 +894,7 @@ fn failover_scenario() -> Scenario {
     let mut trace = Trace::new(&cluster);
     trace.start(
         &cluster,
-        format!("node-{first_leader} leads; the election noop is committed"),
+        format!("node-{first_leader} leads; its first blank entry is committed"),
     );
     assert!(committed_write(
         &mut trace,
@@ -916,7 +919,9 @@ fn failover_scenario() -> Scenario {
     let new_term = cluster.node(new_leader).current_term();
     trace.note(
         &cluster,
-        format!("node-{new_leader} is elected in term {new_term}; every committed entry is still present"),
+        format!(
+            "node-{new_leader} takes over in term {new_term}; the committed entry is still there"
+        ),
     );
     assert!(committed_write(
         &mut trace,
@@ -928,7 +933,7 @@ fn failover_scenario() -> Scenario {
     cluster.restart(first_leader);
     trace.note(
         &cluster,
-        format!("node-{first_leader} is switched back on and fetches the entries it missed"),
+        format!("node-{first_leader} is switched back on and has to fetch what it missed"),
     );
     let deadline = cluster.now() + 2_000;
     let caught_up = trace.run_until(&mut cluster, deadline, |cluster| {
@@ -937,10 +942,11 @@ fn failover_scenario() -> Scenario {
         })
     });
     assert!(caught_up, "the restarted node did not catch up");
-    trace.note(&cluster, "every node agrees on both writes");
+    trace.note(&cluster, "every machine agrees on both writes");
     Scenario {
         name: "Failover",
-        description: "The leader is killed after a committed write. The rest elect a new leader, a second write commits, and the old node catches up when it returns.",
+        description: "The leader dies after a committed write. The other four notice the silence, hold a new election in a higher term, and commit a second write under a new leader. When the old leader is switched back on, it asks for what it missed and catches up.",
+        watch: "the committed entry surviving the death of the leader that accepted it, and the restarted machine filling in what it missed.",
         samples: trace.samples,
     }
 }
@@ -954,20 +960,20 @@ fn partition_scenario() -> Scenario {
     let term = cluster.node(isolated).current_term();
     trace.start(
         &cluster,
-        format!("node-{isolated} leads in term {term}; the election noop is committed"),
+        format!("node-{isolated} leads in term {term}; its first blank entry is committed"),
     );
 
     let connected: Vec<NodeId> = (0..5).filter(|id| *id != isolated).collect();
     cluster.partition(&[vec![isolated], connected]);
     trace.note(
         &cluster,
-        format!("node-{isolated} is cut off; every link between it and the other four is dropped"),
+        format!("node-{isolated} is cut off: it can no longer reach the other four"),
     );
 
     trace.send_client(
         &cluster,
         "set lost=v",
-        format!("client sends set lost=v to node-{isolated}"),
+        format!("client asks node-{isolated} to set lost to v"),
     );
     let write = cluster
         .begin_write(isolated, set("lost", "v"))
@@ -975,7 +981,7 @@ fn partition_scenario() -> Scenario {
     trace.note(
         &cluster,
         format!(
-            "node-{isolated} appends it at index {}, with no one to replicate to",
+            "node-{isolated} writes it into its own log as entry {}, but there is nobody to copy it to",
             write.index
         ),
     );
@@ -995,13 +1001,13 @@ fn partition_scenario() -> Scenario {
     let new_term = cluster.node(new_leader).current_term();
     trace.note(
         &cluster,
-        format!("the four connected nodes elect node-{new_leader} in term {new_term}"),
+        format!("the other four elect node-{new_leader} in term {new_term}"),
     );
     trace.finish_client(
         &cluster,
         ClientStatus::Refused,
         Some("no majority, never committed".to_string()),
-        "set lost=v can never commit on the isolated node, so the client gets no answer",
+        "set lost=v never reaches a majority, so it never commits",
     );
 
     assert!(committed_write(
@@ -1015,7 +1021,7 @@ fn partition_scenario() -> Scenario {
     cluster.heal();
     trace.note(
         &cluster,
-        format!("the split heals; node-{isolated} sees term {new_term} and its stranded entry is replaced"),
+        format!("the split heals; node-{isolated} now has to catch up"),
     );
     let deadline = cluster.now() + 2_000;
     let converged = trace.run_until(&mut cluster, deadline, |cluster| {
@@ -1026,11 +1032,12 @@ fn partition_scenario() -> Scenario {
     assert!(converged, "the cluster did not converge after the heal");
     trace.note(
         &cluster,
-        "every node agrees on set kept=k, and set lost=v never happened",
+        "all five machines agree on set kept=k, and set lost=v is gone",
     );
     Scenario {
         name: "Partition",
-        description: "The leader is cut off from the other four. A write it accepts never commits; the majority elects a new leader; when the split heals, the stranded entry is overwritten.",
+        description: "The leader is cut off from the other four. It keeps accepting writes because it does not know it is alone, but without a majority nothing can commit, so it can never answer the client. The four connected machines elect a new leader and commit their own write.",
+        watch: "the stranded entry never committing, then being replaced once the split heals.",
         samples: trace.samples,
     }
 }
@@ -1057,7 +1064,9 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
   .tab.active{background:#21262d;border-color:#6e7781;color:var(--text);font-weight:600}
   .control:disabled{opacity:.4;cursor:default}
   .tab:focus-visible,.control:focus-visible,input[type=range]:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}
-  .description{margin:0 0 16px;color:var(--muted);font-size:14px;min-height:22px}
+  .description{margin:0 0 6px;color:var(--muted);font-size:14px}
+  .watch{margin:0 0 16px;color:var(--muted);font-size:13.5px}
+  .watch b{color:var(--prose);font-weight:600}
   .transport{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin:0 0 12px}
   .transport label{font:12px/1 var(--mono);color:var(--muted)}
   input[type=range]{width:120px;accent-color:#8b949e}
@@ -1068,6 +1077,7 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
   .board{display:grid;grid-template-columns:minmax(0,1fr) 302px;gap:14px;align-items:start}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:14px}
   .panel-title{margin:0 0 10px;font:600 10.5px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .hint{margin:0 0 12px;color:var(--muted);font-size:12.5px;line-height:1.55}
   .client{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel-2);margin:0 0 12px;font:12.5px/1.5 var(--mono)}
   .client.hidden{display:none}
   .client .k{color:var(--muted)}
@@ -1130,9 +1140,10 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
 <main>
   <p class="kicker">raft-kv · simulator traces</p>
   <h1>Watch a Raft cluster agree</h1>
-  <p class="intro">Every frame on this page is recorded by the Rust simulator in this repository, the same code the tests run. Step through an election, a write, a leader failure, and a partition. Times are simulated milliseconds, not wall-clock.</p>
+  <p class="intro">Raft makes a group of machines agree on one log, an ordered list of every change the cluster accepts, and keeps them agreeing even when machines crash. One machine leads, every change is copied from it into the others' logs, and nothing is final until more than half the machines have stored it. Each scenario below is a recorded run of this repository's simulator. Times are simulated milliseconds, not wall-clock.</p>
   <nav class="tabs" id="scenarios" aria-label="Scenarios"></nav>
   <p class="description" id="description"></p>
+  <p class="watch" id="watch"></p>
   <div class="transport">
     <button type="button" class="control" id="reset" title="Back to the first sample">Reset</button>
     <button type="button" class="control" id="back" title="Previous sample">Back</button>
@@ -1146,6 +1157,7 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
   <p class="step-event" id="currentEvent">initial state</p>
   <div class="board">
     <section class="panel">
+      <p class="hint">Each row is one machine, and each box is one entry in its log. An entry is committed once more than half the machines have stored it, and every machine applies committed entries to its own data, in order. Term is the round number, and the chip is the machine's role.</p>
       <div class="client hidden" id="clientStrip"></div>
       <div id="ruler"></div>
       <div id="nodes"></div>
@@ -1173,6 +1185,7 @@ const clientText = client => {
   if (client.status === 'committed') return client.elapsed_ms === 0 ? 'committed under 1 ms' : `committed in ${client.elapsed_ms} ms`;
   return client.detail || 'no answer';
 };
+const logName = entry => entry === 'noop' ? 'a blank entry' : entry;
 
 function eventFor(sample, previous) {
   if (sample.note) return sample.note;
@@ -1181,27 +1194,27 @@ function eventFor(sample, previous) {
   sample.nodes.forEach((node, i) => {
     const old = previous.nodes[i];
     if (!old) return;
-    if (node.stopped && !old.stopped) { changes.push(`node-${node.id} stops`); return; }
-    if (!node.stopped && old.stopped) { changes.push(`node-${node.id} starts again`); return; }
+    if (node.stopped && !old.stopped) { changes.push(`node-${node.id} stops taking part`); return; }
+    if (!node.stopped && old.stopped) { changes.push(`node-${node.id} comes back`); return; }
     if (node.role !== old.role) {
-      if (node.role === 'Candidate') changes.push(`node-${node.id} campaigns in term ${node.term}`);
-      else if (node.role === 'Leader') changes.push(`node-${node.id} becomes leader in term ${node.term}`);
-      else changes.push(`node-${node.id} steps down to follower`);
+      if (node.role === 'Candidate') changes.push(`node-${node.id} asks the others to vote for it (term ${node.term})`);
+      else if (node.role === 'Leader') changes.push(`node-${node.id} wins the vote and leads term ${node.term}`);
+      else changes.push(`node-${node.id} steps down`);
     } else if (node.term !== old.term) {
-      changes.push(`node-${node.id} moves to term ${node.term}`);
+      changes.push(`node-${node.id} moves up to term ${node.term}`);
     }
     node.log.forEach((entry, at) => {
-      if (old.log[at] !== undefined && old.log[at] !== entry) changes.push(`node-${node.id} replaces entry ${at + 1} with ${entry}`);
+      if (old.log[at] !== undefined && old.log[at] !== entry) changes.push(`node-${node.id} replaces entry ${at + 1} with ${logName(entry)}`);
     });
-    if (node.log.length > old.log.length) changes.push(`node-${node.id} appends ${node.log.slice(old.log.length).join(', ')}`);
+    if (node.log.length > old.log.length) changes.push(`node-${node.id} adds ${node.log.slice(old.log.length).map(logName).join(', ')}`);
     if (node.voted_for !== old.voted_for && node.voted_for !== null && node.role !== 'Leader' && node.role !== 'Candidate') changes.push(`node-${node.id} votes for node-${node.voted_for}`);
-    if (node.commit !== old.commit) changes.push(`node-${node.id} commits through ${node.commit}`);
-    else if (node.applied !== old.applied) changes.push(`node-${node.id} applies through ${node.applied}`);
+    if (node.commit !== old.commit) changes.push(`node-${node.id} commits through entry ${node.commit}`);
+    else if (node.applied !== old.applied) changes.push(`node-${node.id} applies through entry ${node.applied}`);
   });
   if (sample.client && (!previous.client || sample.client.label !== previous.client.label || sample.client.status !== previous.client.status)) {
     changes.push(`client ${sample.client.label}: ${clientText(sample.client)}`);
   }
-  return changes.join(' · ') || 'heartbeats keep the nodes aligned';
+  return changes.join(' · ') || 'heartbeats keep everyone in sync';
 }
 
 function traceWidth(trace) {
@@ -1213,7 +1226,7 @@ function nodeHtml(node) {
     ? node.log.map((entry, at) => {
         const position = at + 1;
         const state = position <= node.applied ? 'applied' : position <= node.commit ? 'committed' : 'stored';
-        return `<span class="cell ${state}" title="index ${position}: ${esc(entry)}">${esc(entry)}</span>`;
+        return `<span class="cell ${state}" title="index ${position}: ${esc(entry === 'noop' ? 'blank entry (noop)' : entry)}">${esc(entry)}</span>`;
       }).join('')
     : '<span class="empty">no entries</span>';
   const chip = node.stopped
@@ -1243,6 +1256,7 @@ function render() {
   const previous = trace.samples[index - 1];
 
   $('description').textContent = trace.description;
+  $('watch').innerHTML = `<b>Watch for:</b> ${esc(trace.watch)}`;
   $('currentEvent').textContent = eventFor(sample, previous);
   $('time').textContent = `${sample.time_ms} ms`;
   $('position').textContent = `${index + 1} / ${trace.samples.length}`;
@@ -1355,9 +1369,10 @@ fn scenario_json(scenario: &Scenario) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"name\":\"{}\",\"description\":\"{}\",\"samples\":[{}]}}",
+        "{{\"name\":\"{}\",\"description\":\"{}\",\"watch\":\"{}\",\"samples\":[{}]}}",
         json_escape(scenario.name),
         json_escape(scenario.description),
+        json_escape(scenario.watch),
         samples
     )
 }
@@ -1576,6 +1591,7 @@ mod tests {
         }
         for control in [
             "id=\"scenarios\"",
+            "id=\"watch\"",
             "id=\"play\"",
             "id=\"step\"",
             "id=\"back\"",
@@ -1589,6 +1605,10 @@ mod tests {
         }
         assert!(!html.contains("<script src="));
         assert!(!html.contains("<link rel=\"stylesheet\""));
+        assert!(
+            html.contains("\"watch\":\""),
+            "every scenario carries a watch line"
+        );
     }
 
     #[test]
@@ -1736,7 +1756,7 @@ const html = fs.readFileSync(0, 'utf8');
 const source = html.match(/<script>([\s\S]*)<\/script>/)[1];
 const elements = new Map();
 const element = () => ({ value: '', textContent: '', innerHTML: '', className: '', disabled: false, onclick: null, oninput: null, options: [], add() {} });
-for (const id of ['scenarios', 'description', 'clientStrip', 'ruler', 'nodes', 'events', 'time', 'position', 'currentEvent', 'play', 'step', 'back', 'reset', 'speed', 'speedLabel']) elements.set(id, element());
+for (const id of ['scenarios', 'description', 'watch', 'clientStrip', 'ruler', 'nodes', 'events', 'time', 'position', 'currentEvent', 'play', 'step', 'back', 'reset', 'speed', 'speedLabel']) elements.set(id, element());
 elements.get('speed').value = '600';
 const timers = new Set();
 const context = {
@@ -1766,6 +1786,7 @@ if (!position.textContent.startsWith('1 / ')) throw new Error('reset did not ret
 elements.get('scenarios').onclick({ target: { closest: () => ({ dataset: { scenario: '3' } }) } });
 if (!/^1 \/ \d+$/.test(position.textContent)) throw new Error('scenario switch did not reset the step');
 if (!elements.get('description').textContent) throw new Error('scenario switch did not update the description');
+if (!elements.get('watch').innerHTML) throw new Error('scenario switch did not update the watch line');
 console.log('trace explorer runtime probe passed');
 "#;
         let mut child = match ProcessCommand::new("node")
