@@ -1044,6 +1044,9 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
   .kicker{margin:0 0 6px;font:600 11.5px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
   h1{margin:0 0 10px;font-size:30px;line-height:1.2;letter-spacing:-.014em;font-weight:650}
   .intro{margin:0 0 12px;max-width:72ch;color:var(--prose)}
+  .masthead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}
+  .repo-link{display:inline-block;margin-top:4px;padding:8px 13px;border-radius:0;background:#fff;color:#0f1115;font:650 12.5px/1 var(--sans);letter-spacing:.01em;text-decoration:none;white-space:nowrap}
+  .repo-link:hover{background:#d9d5cc}
   .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 10px}
   .tab,.control{font:13.5px/1 var(--sans);color:var(--prose);background:transparent;border:1px solid var(--line);border-radius:7px;padding:9px 13px;cursor:pointer}
   .control{padding:8px 12px}
@@ -1118,8 +1121,13 @@ const EXPLORER_TEMPLATE: &str = r##"<!doctype html>
 </head>
 <body>
 <main>
-  <p class="kicker">raft-kv · simulator traces</p>
-  <h1>Watch a Raft cluster agree</h1>
+  <header class="masthead">
+    <div>
+      <p class="kicker">raft-kv · simulator traces</p>
+      <h1>Watch a Raft cluster agree</h1>
+    </div>
+    <a class="repo-link" href="https://github.com/stra-ta/raft-kv">View Repo</a>
+  </header>
   <p class="intro">raft-kv implements Raft from scratch in Rust and runs it in a deterministic simulator: the same run happens every time. Raft lets a group of machines agree on one order of events even while some of them crash. One machine leads, every change is copied into every log, and a change counts only once more than half the group has stored it.</p>
   <p class="intro">This page replays four recorded runs from the simulator: an election, a write, a leader failure, and a network split. Times are simulated milliseconds, not wall-clock.</p>
   <nav class="tabs" id="scenarios" aria-label="Scenarios"></nav>
