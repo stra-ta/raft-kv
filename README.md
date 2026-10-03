@@ -47,7 +47,7 @@ The process runner adds framed TCP, atomic Raft persistence, and an LSM-backed s
 
 [Start a cluster, inspect metrics, test failures, and read the limits](GUIDE.md).
 
-[Open the interactive trace explorer](docs/raft-explorer.html).
+[Open the trace explorer](https://stra-ta.github.io/raft-kv/) to step through an election, a write, a leader kill, and a partition; the checked-in copy is [docs/raft-explorer.html](docs/raft-explorer.html).
 
 ## Build
 

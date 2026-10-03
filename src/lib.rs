@@ -146,7 +146,7 @@ mod tests {
         let leader = cluster.leader().unwrap();
         for index in 0..10 {
             let write = cluster
-                .start_write_for_test(
+                .begin_write(
                     leader,
                     ClientRequest::Set {
                         key: format!("k{index}"),
@@ -169,7 +169,7 @@ mod tests {
         assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
         let leader = cluster.leader().unwrap();
         let write = cluster
-            .start_write_for_test(
+            .begin_write(
                 leader,
                 ClientRequest::Set {
                     key: "early".to_string(),
@@ -232,7 +232,7 @@ mod tests {
         assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
         let old_leader = cluster.leader().unwrap();
         let write = cluster
-            .start_write_for_test(
+            .begin_write(
                 old_leader,
                 ClientRequest::Set {
                     key: "stepped_down".to_string(),

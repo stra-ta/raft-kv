@@ -1,0 +1,60 @@
+name: Pages
+
+# Publishes the trace explorer to https://stra-ta.github.io/raft-kv/.
+#
+# The page is one generated file with its traces embedded, so the deploy
+# stages it as index.html and nothing else. Regenerate it locally with
+# `cargo run --release --bin raft-demo` after changing the simulator.
+#
+# Repository Pages has to be enabled once with "GitHub Actions" as the source
+# before this can deploy. That step is manual: configure-pages can do it only
+# with a token other than GITHUB_TOKEN, so it is used here for metadata only.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/raft-explorer.html"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Top level, not per job, and deliberately so. A job-level permissions block
+# replaces this one instead of merging with it, and anything it omits is set to
+# none, which would leave actions/checkout unable to clone the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Stage the page
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp docs/raft-explorer.html _site/index.html
+          # The page carries its own traces. An empty or truncated file would
+          # still deploy and still look like a site, so fail here instead.
+          test -s _site/index.html
+          grep -qF 'const traces = [' _site/index.html
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: _site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

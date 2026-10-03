@@ -79,7 +79,7 @@ The simulator records the path from a steady leader to crash, election, and reco
 
 The generated timeline ([`docs/failover.svg`](docs/failover.svg)) and the explanatory story show different simulator traces, not one canonical node-by-node sequence.
 
-Open the self-contained [interactive trace explorer](docs/raft-explorer.html) to play, pause, step, and inspect deterministic election and failover samples.
+Open the [trace explorer](https://stra-ta.github.io/raft-kv/) to play, pause, and step through deterministic election, write, failover, and partition samples; the checked-in copy is [`docs/raft-explorer.html`](docs/raft-explorer.html).
 
 ![Failover story](docs/failover-story.svg)
 
@@ -200,4 +200,4 @@ The suite also covers persistence, frame encoding, metrics, and real TCP process
 - [`docs/failover.svg`](docs/failover.svg): deterministic failover flow.
 - [`docs/failover-story.svg`](docs/failover-story.svg): failover trace illustration.
 - [`docs/log-ledger.svg`](docs/log-ledger.svg): replicated log view.
-- [`docs/raft-explorer.html`](docs/raft-explorer.html): interactive deterministic trace explorer.
+- [`docs/raft-explorer.html`](docs/raft-explorer.html): interactive deterministic trace explorer for elections, writes, failover, and partitions.

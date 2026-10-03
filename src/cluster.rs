@@ -373,16 +373,27 @@ impl Cluster {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_write_for_test(
+    /// Starts a client write on `leader` and queues its outbound messages
+    /// without driving the simulator. The caller advances the cluster and
+    /// observes the result with [`Node::write_committed_and_applied`]. This
+    /// path does not record into the operation history; the blocking,
+    /// recorded client path remains [`Cluster::propose`].
+    pub fn begin_write(
         &mut self,
         leader: NodeId,
         request: ClientRequest,
     ) -> Result<crate::PendingWrite, ClientReply> {
+        if !self.nodes.contains_key(&leader) || self.is_stopped_internal(leader) {
+            return Err(ClientReply {
+                success: false,
+                leader_id: None,
+                response: None,
+            });
+        }
         let (write, messages) = self
             .nodes
             .get_mut(&leader)
-            .unwrap()
+            .expect("node checked above")
             .start_client_write(request)?;
         self.enqueue(messages);
         Ok(write)
@@ -412,7 +423,11 @@ impl Cluster {
         self.now_ms
     }
 
-    fn step(&mut self) {
+    /// Advances the simulation by exactly one step: one queued message when
+    /// one is ready, otherwise the clock advances a millisecond and every
+    /// node ticks. `run_for` and `run_until` loop over this; the trace
+    /// generator calls it directly so no intermediate state is skipped.
+    pub fn step(&mut self) {
         self.apply_scheduled_faults();
         if let Some(index) = self.next_ready_message_index() {
             let message = self.messages.remove(index).message;
