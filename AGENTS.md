@@ -20,6 +20,10 @@ It separates Raft safety and liveness rules, durable process state, the LSM stat
 Use `./scripts/verify` for the functional and process-level suite.
 Use `./scripts/confidence` for formatting, Clippy, all-target tests, and a release build.
 
+For a faster local test loop, `cargo nextest run` runs the same test targets in parallel with per-test process isolation.
+Nextest does not run doctests, so keep `cargo test --doc` alongside it.
+The scripts above remain the authority for verification and evidence.
+
 ## Lab-wide contracts
 
 - See https://github.com/stra-ta/.github/blob/main/LAB_RULES.md and https://github.com/stra-ta/.github/blob/main/EVIDENCE.md and https://github.com/stra-ta/.github/blob/main/COMPATIBILITY.md for lab-wide naming, evidence, and schema contracts.
