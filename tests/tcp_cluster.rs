@@ -39,7 +39,8 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
 
     let new_leader =
         wait_for_leader_except(&peers, leader, Duration::from_secs(5)).expect("new leader elected");
-    let reply = send_client(
+    let reply = send_client_retried(
+        &peers,
         &peers[&new_leader],
         ClientRequest::Set {
             key: "baz".to_string(),
@@ -261,7 +262,8 @@ fn cluster_recovers_state_after_full_restart() {
     let mut children = spawn_cluster(dir.path(), &peers, &metrics);
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
-    let reply = send_client(
+    let reply = send_client_retried(
+        &peers,
         &peers[&leader],
         ClientRequest::Set {
             key: "alpha".to_string(),
@@ -294,7 +296,8 @@ fn cluster_recovers_state_after_full_restart() {
     );
 
     // New writes should still work.
-    let reply = send_client(
+    let reply = send_client_retried(
+        &peers,
         &peers[&new_leader],
         ClientRequest::Set {
             key: "charlie".to_string(),
@@ -322,7 +325,8 @@ fn metrics_endpoint_exposes_raft_metrics() {
     let children = spawn_cluster(dir.path(), &peers, &metrics);
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
-    let reply = send_client(
+    let reply = send_client_retried(
+        &peers,
         &peers[&leader],
         ClientRequest::Set {
             key: "metrics".to_string(),
