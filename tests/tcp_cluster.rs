@@ -289,7 +289,7 @@ fn cluster_recovers_state_after_full_restart() {
 }
 
 #[test]
-fn metrics_endpoint_exposes_raft_and_lsm_metrics() {
+fn metrics_endpoint_exposes_raft_metrics() {
     let dir = tempfile::tempdir().unwrap();
     let peers = reserve_ports(3);
     let metrics = reserve_ports(3);
@@ -315,9 +315,6 @@ fn metrics_endpoint_exposes_raft_and_lsm_metrics() {
         "raft_writes_total",
         "raft_write_latency_seconds",
         "raft_replication_lag",
-        "lsm_memtable_size_bytes",
-        "lsm_sstable_count",
-        "lsm_compactions_total",
     ] {
         assert!(body.contains(name), "missing {name}\n{body}");
     }

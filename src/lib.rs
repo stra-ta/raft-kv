@@ -1,6 +1,5 @@
 pub mod cluster;
 pub mod history;
-pub mod lsm;
 pub mod net;
 pub mod node;
 pub mod observability;

@@ -3,7 +3,7 @@
 ## Purpose
 
 raft-kv is the distributed-system target in the stra-ta lab.
-It separates Raft safety and liveness rules, durable process state, the LSM state machine, framed transport, and external history checking.
+It separates Raft safety and liveness rules, durable process state, the in-memory state machine recovered from the durable log, framed transport, and external history checking.
 
 ## Invariants
 

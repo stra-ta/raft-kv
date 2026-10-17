@@ -1,6 +1,6 @@
-use raft_kv::lsm::{LsmOptions, LsmTree};
 use raft_kv::net::{WireMessage, read_frame, write_peer_frame, write_reply_frame};
 use raft_kv::observability::{NodeMetrics, init_tracing};
+use raft_kv::state_machine::MemoryStateMachine;
 use raft_kv::storage::{PersistedState, load_node_with_state_machine, save_node};
 use raft_kv::{ClientRequest, Node, NodeId, PendingRead, Role};
 use std::collections::HashMap;
@@ -33,8 +33,12 @@ fn run() -> io::Result<()> {
     let ids: Vec<_> = config.peers.keys().copied().collect();
     let mut peer_ids: Vec<_> = ids.into_iter().filter(|&id| id != config.id).collect();
     peer_ids.sort_unstable();
-    let lsm = LsmTree::open(config.lsm_dir(), LsmOptions::default())?;
-    let node = load_node_with_state_machine(&config.state_path, config.id, peer_ids, lsm)?;
+    let node = load_node_with_state_machine(
+        &config.state_path,
+        config.id,
+        peer_ids,
+        MemoryStateMachine::new(),
+    )?;
     let metrics = NodeMetrics::new(config.id)?;
     let shared = Arc::new(Mutex::new(Runtime::new(
         node,
@@ -435,7 +439,7 @@ fn handle_metrics_connection(stream: &mut TcpStream, metrics: &NodeMetrics) -> i
 }
 
 struct Runtime {
-    node: Node<LsmTree>,
+    node: Node<MemoryStateMachine>,
     started: Instant,
     last_saved: PersistedState,
     metrics: NodeMetrics,
@@ -445,7 +449,11 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(node: Node<LsmTree>, metrics: NodeMetrics, snapshot_threshold: usize) -> Self {
+    fn new(
+        node: Node<MemoryStateMachine>,
+        metrics: NodeMetrics,
+        snapshot_threshold: usize,
+    ) -> Self {
         let last_saved = PersistedState::from_node(&node);
         let last_role = node.role();
         let last_leader_id = node.leader_id();
@@ -503,12 +511,6 @@ impl Runtime {
         for (peer, lag) in self.node.replication_lag_by_peer() {
             self.metrics.set_replication_lag(peer, lag);
         }
-        self.metrics.set_lsm_state(
-            self.node.state_machine().memtable_size_bytes(),
-            self.node.state_machine().sstable_count(),
-        );
-        self.metrics
-            .set_lsm_compactions_total(self.node.state_machine().compactions_total());
     }
 }
 
@@ -522,17 +524,6 @@ struct Config {
 }
 
 impl Config {
-    fn lsm_dir(&self) -> PathBuf {
-        let mut path = self.state_path.clone();
-        let name = self
-            .state_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("node.bin");
-        path.set_file_name(format!("{name}.lsm"));
-        path
-    }
-
     fn from_args(args: Vec<String>) -> io::Result<Self> {
         if args.len() < 5 {
             return Err(io::Error::new(
