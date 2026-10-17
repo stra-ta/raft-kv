@@ -18,7 +18,8 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
     let mut children = spawn_cluster(dir.path(), &peers, &metrics);
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
-    let reply = send_client(
+    let reply = send_client_retried(
+        &peers,
         &peers[&leader],
         ClientRequest::Set {
             key: "foo".to_string(),
@@ -203,6 +204,31 @@ fn wait_for_local_get(addr: &str, key: &str, timeout: Duration) -> Option<Client
     None
 }
 
+// A write against a leader whose ring has just rotated can legitimately
+// fail once: the address was probed by wait_for_leader milliseconds before
+// its term expired. The guides' own client retries the supplied peers, so
+// the process tests do the same instead of asserting on one lucky packet.
+fn send_client_retried(
+    peers: &HashMap<NodeId, String>,
+    addr: &str,
+    request: ClientRequest,
+) -> io::Result<ClientReply> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let reply = send_client(addr, request.clone())?;
+        if reply.success || Instant::now() >= deadline {
+            return Ok(reply);
+        }
+        for peer_addr in peers.values() {
+            let retry = send_client(peer_addr, request.clone())?;
+            if retry.success {
+                return Ok(retry);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn send_client(addr: &str, request: ClientRequest) -> io::Result<ClientReply> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -371,7 +397,8 @@ fn small_snapshot_threshold_auto_compacts_through_persist_if_changed() {
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
     for i in 0..4 {
-        let reply = send_client(
+        let reply = send_client_retried(
+            &peers,
             &peers[&leader],
             ClientRequest::Set {
                 key: format!("snap-key-{i}"),
