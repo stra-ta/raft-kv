@@ -17,9 +17,6 @@ pub struct NodeMetrics {
     writes_total: IntCounter,
     write_latency: Histogram,
     replication_lag: IntGaugeVec,
-    lsm_memtable_size_bytes: IntGauge,
-    lsm_sstable_count: IntGauge,
-    lsm_compactions_total: IntCounter,
 }
 
 impl NodeMetrics {
@@ -60,14 +57,6 @@ impl NodeMetrics {
             &["follower"],
         )
         .map_err(io::Error::other)?;
-        let lsm_memtable_size_bytes = int_gauge(
-            "lsm_memtable_size_bytes",
-            "Current LSM memtable size in bytes.",
-        )?;
-        let lsm_sstable_count = int_gauge("lsm_sstable_count", "Current number of LSM SSTables.")?;
-        let lsm_compactions_total =
-            int_counter("lsm_compactions_total", "Total LSM compactions completed.")?;
-
         for collector in [
             Box::new(term.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(state.clone()),
@@ -78,9 +67,6 @@ impl NodeMetrics {
             Box::new(writes_total.clone()),
             Box::new(write_latency.clone()),
             Box::new(replication_lag.clone()),
-            Box::new(lsm_memtable_size_bytes.clone()),
-            Box::new(lsm_sstable_count.clone()),
-            Box::new(lsm_compactions_total.clone()),
         ] {
             registry.register(collector).map_err(io::Error::other)?;
         }
@@ -96,9 +82,6 @@ impl NodeMetrics {
             writes_total,
             write_latency,
             replication_lag,
-            lsm_memtable_size_bytes,
-            lsm_sstable_count,
-            lsm_compactions_total,
         })
     }
 
@@ -117,20 +100,6 @@ impl NodeMetrics {
         self.replication_lag
             .with_label_values(&[&follower.to_string()])
             .set(saturating_i64(lag));
-    }
-
-    pub fn set_lsm_state(&self, memtable_bytes: usize, sstable_count: usize) {
-        self.lsm_memtable_size_bytes
-            .set(saturating_i64(memtable_bytes));
-        self.lsm_sstable_count.set(saturating_i64(sstable_count));
-    }
-
-    pub fn set_lsm_compactions_total(&self, total: usize) {
-        let current = self.lsm_compactions_total.get();
-        let target = total as u64;
-        if target > current {
-            self.lsm_compactions_total.inc_by(target - current);
-        }
     }
 
     pub fn inc_elections(&self) {
@@ -199,7 +168,6 @@ mod tests {
     fn renders_required_metrics() {
         let metrics = NodeMetrics::new(0).unwrap();
         metrics.set_raft_state(2, "leader", 4, 3);
-        metrics.set_lsm_state(128, 2);
         metrics.observe_write(0.01);
         let body = metrics.render().unwrap();
 
@@ -212,9 +180,6 @@ mod tests {
             "raft_leader_changes_total",
             "raft_writes_total",
             "raft_write_latency_seconds",
-            "lsm_memtable_size_bytes",
-            "lsm_sstable_count",
-            "lsm_compactions_total",
         ] {
             assert!(body.contains(name), "missing metric {name}\n{body}");
         }
